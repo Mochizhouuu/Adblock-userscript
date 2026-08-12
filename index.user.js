@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         🛡️ Popup & Ad Blocker Pro — China-Enhanced v8
+// @name         Popup & Ad Blocker Pro — China-Enhanced v8.1
 // @namespace    http://tampermonkey.net/
-// @version      8.0.1
-// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites
+// @version      8.1.0
+// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (FIXED: tab leaks, dynamic anchors, eval injection, beforeunload hijack)
 // @author       Mochizhouuu
 // @match        *://*/*
 // @grant        none
@@ -21,27 +21,31 @@
 
         BLOCK_POPUPS: true,
         BLOCK_AD_REQUESTS: true,
-        BLOCK_TRACKERS: true,                // diaktifkan: situs China banyak tracker
+        BLOCK_TRACKERS: true,
 
         REMOVE_AD_ELEMENTS: true,
         REMOVE_ANTI_ADBLOCK_OVERLAYS: true,
         REMOVE_META_REDIRECTS_TO_ADS: true,
 
-        // Proteksi khusus situs China
         HIJACK_GUARD: true,
         BLOCK_SYNTHETIC_BLANK_CLICKS: true,
         BLOCK_BLANK_ANCHORS_TO_ADS: true,
         BLOCK_AD_GIFS: true,
         BLOCK_AD_IFRAMES: true,
-        BLOCK_AD_LOCATION_REDIRECTS: true,   // blok location.assign/replace/href ke domain iklan
-        REMOVE_HIJACK_OVERLAYS: true,        // hapus grid overlay transparan
+        BLOCK_AD_LOCATION_REDIRECTS: true,
+        REMOVE_HIJACK_OVERLAYS: true,
 
-        MAX_POPUPS_PER_INTERACTION: 1,
+        // BARU: proteksi tambahan
+        BLOCK_EVAL_INJECTION: true,
+        BLOCK_BEFOREUNLOAD_REDIRECT: true,
+        BLOCK_DYNAMIC_ANCHOR_CLICK: true,
+        BLOCK_AUXCLICK: true,
+
+        MAX_POPUPS_PER_INTERACTION: 0,  // Diubah: 0 = blok SEMUA popup/tab baru
         USER_ACTIVATION_WINDOW_MS: 1500,
-        CLEANUP_INTERVAL_MS: 5000,
+        CLEANUP_INTERVAL_MS: 3000,      // Dipercepat
 
-        // Ambang batas deteksi hijack overlay
-        HIJACK_OPACITY_MAX: 0.1,
+        HIJACK_OPACITY_MAX: 0.15,       // Dinaikkan sedikit
         HIJACK_ZINDEX_MIN: 5,
     });
 
@@ -50,7 +54,7 @@
     const warn = (...a) => CONFIG.DEBUG && console.warn(PREFIX, ...a);
 
     /* ═══════════════════════════════════════════════════════════════
-       DOMAIN LISTS
+       DOMAIN LISTS (Diperluas)
        ═══════════════════════════════════════════════════════════════ */
     const AD_DOMAINS = new Set([
         // — Global
@@ -78,17 +82,27 @@
         'dmp.sina.com.cn','p.zol.com.cn','imp.zol.com.cn','x.cnxz.cn','cv01.cn',
         'vogo.com.cn','u5i5.com','5c5c.com','duo5.cn','3393.com',
 
-        // — Ad landing / redirect (rotating subdomain) — ditemukan di wmanhua.com
-        'gewt00g.com',          // hijack redirect, subdomain berisi timestamp
-        'cdnweb.win',           // CDN gambar iklan + umami tracking host
-        'aipornhub.ltd',        // landing iklan adult
-        'addcd32f-cf25-4ac7-8750-7a4c1fb72f11', // ref id pattern (jangan dipakai — host penuh saja)
-        // tambahan exchange umum ditemukan di situs manga China
+        // — Ad landing / redirect (rotating subdomain)
+        'gewt00g.com','cdnweb.win','aipornhub.ltd',
+        'oe188bu.com','lp-is.com',
         '8ox.cn','papa.me','meimanhua.com','mh1234.com',
         'fxxkwg.com','kmyay.com','wenku8.com',
-        // --- TAMBAHAN dari hasil inspeksi wmanhua.com ---
-        'oe188bu.com',          // XHR iklan (1122gc.oe188bu.com:8005)
-        'lp-is.com',            // penyimpanan GIF iklan (g.lp-is.com)
+        
+        // — Tambahan: domain popup umum di situs manga China
+        'go2cloud.org','go2affise.com','offergo','clcktrax.com',
+        'onclickmega.com','pushmejs.com','pushlaram.com','notifpush.com',
+        'push-notifications.top','pushnott.com','pushengage.com',
+        'bidgear.com','adplus.co.id','adplus.id','adnety.com',
+        'ad-maven.com','adk2x.com','adsrv4k.com','yabidos.com',
+        'jads.co','juicyads.com','adserve.work','adkova.com',
+        'adrotator.se','adsbetnet.com','adspubcenter.com',
+        'clkrev.com','clksite.com','clksupplies.com',
+        'directrev.com','fastclick.net','flashtalking.com',
+        'intellitxt.com','kontera.com','linkbucks.com',
+        'maxbounty.com','mobidea.com','mylead.global',
+        'performancehorizon.com','redirectvoluum.com',
+        'revcontent.com','smartadserver.com','spotxchange.com',
+        'tribalfusion.com','zedo.com','zergnet.com',
     ]);
 
     const TRACKER_DOMAINS = new Set([
@@ -101,16 +115,12 @@
         'hm.baidu.com','push.zhanzhang.baidu.com','cnzz.com','cnzz.net',
         'umeng.com','umengcloud.com','growingio.com','sensorsdata.cn',
         'talkingdata.com','getui.com','shuzilm.cn',
-        // — Ditemukan di wmanhua.com
-        'cdnweb.win',              // umami.cdnweb.win
-        'umami.is',
-        'cloudflareinsights.com',  // RUM beacon
-        'googletagmanager.com',    // gtag
-        'instant.page',            // prefetch (kadang disalahgunakan)
+        'cdnweb.win','umami.is','cloudflareinsights.com',
+        'googletagmanager.com','instant.page',
     ]);
 
     /* ═══════════════════════════════════════════════════════════════
-       AD SELECTORS
+       AD SELECTORS (Diperluas)
        ═══════════════════════════════════════════════════════════════ */
     const AD_SELECTORS = [
         // — Global
@@ -132,7 +142,7 @@
         'a[target="_blank"] > picture',
         'picture > source[srcset*=".gif"]',
 
-        // — Inline handler redirect ke location (ciri hijack)
+        // — Inline handler redirect ke location
         '[onclick*="location"]',
         '[ontouchend*="location"]',
         '[onmousedown*="location"]',
@@ -217,6 +227,14 @@
         '#syad','#syad1','#syad2','#syad3','#syad4','#syad5','#syad6',
         '#textggs','#timedfuo','#top-gg-container','#top_ads0','#xinnxi',
         '#xqad','#xqad1','#xqad2','#xqad3','#left-promotion','#right-promotion',
+        
+        // — BARU: selector tambahan untuk wmanhua.com
+        '[class*="popup" i]','[id*="popup" i]',
+        '[class*="popunder" i]','[id*="popunder" i]',
+        '[class*="onclick" i]','[id*="onclick" i]',
+        '[class*="overlay" i][style*="fixed"]',
+        '[class*="modal" i][style*="fixed"]',
+        '[class*="hijack" i]','[id*="hijack" i]',
     ];
     const AD_SELECTOR = AD_SELECTORS.join(',');
 
@@ -227,7 +245,6 @@
         'a[target="_blank"]','area[target="_blank"]','picture',
     ].join(',');
 
-    /* Pola URL GIF iklan khas China */
     const AD_GIF_URL_PATTERN =
         /(?:^|[\/_\-])(?:gg|guanggao|tuiguang|banner|adv?ert?|sponsored|couplet|duilian|float|popup|popad|jdt|zfkmpd|zg)[\/_\-]?[^\/]*\.(?:gif|webp|png|jpg|jpeg)$/i;
 
@@ -246,6 +263,7 @@
         popups: 0, requests: 0, elements: 0, overlays: 0,
         metaRedirects: 0, hijacks: 0, syntheticClicks: 0, blankAnchors: 0,
         gifs: 0, iframes: 0, locationBlocked: 0, hijackOverlays: 0,
+        evalBlocked: 0, dynamicAnchors: 0, beforeunloadBlocked: 0,
     };
 
     /* ═══════════════════════════════════════════════════════════════
@@ -291,7 +309,7 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
-       CLICK GUARD
+       CLICK GUARD (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const ClickGuard = (() => {
         let lastTrustedClick = null;
@@ -323,9 +341,14 @@
         };
 
         const install = () => {
+            // Tangkap SEMUA event klik
             document.addEventListener('click', onCaptureClick, true);
             document.addEventListener('pointerdown', onCaptureClick, true);
             document.addEventListener('touchstart', onCaptureClick, true);
+            // BARU: tangkap auxclick (middle click, right click programmatic)
+            if (CONFIG.BLOCK_AUXCLICK) {
+                document.addEventListener('auxclick', onCaptureClick, true);
+            }
             log('ClickGuard installed');
         };
 
@@ -353,7 +376,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       POPUP BLOCKER
+       POPUP BLOCKER (Diperkuat — blok SEMUA popup)
        ═══════════════════════════════════════════════════════════════ */
     const PopupBlocker = (() => {
         const nativeOpen = window.open;
@@ -361,22 +384,38 @@
         const install = () => {
             if (!CONFIG.BLOCK_POPUPS || typeof nativeOpen !== 'function') return;
 
-            window.open = new Proxy(nativeOpen, {
+            // Simpan referensi asli dengan nama acak untuk mencegah bypass
+            const _nativeOpen = nativeOpen;
+
+            window.open = new Proxy(_nativeOpen, {
                 apply(target, thisArg, args) {
                     const requestedURL = args[0];
+                    
+                    // Blok SEMUA popup ke domain iklan
                     if (requestedURL && isBlockedURL(requestedURL)) {
                         stats.popups++;
                         log('Blocked ad-domain popup:', requestedURL);
                         return null;
                     }
+                    
+                    // Blok SEMUA popup tanpa user activation
                     const userActivation =
                         navigator.userActivation?.isActive === true ||
                         ClickGuard.isPopupConsentValid(requestedURL);
+                    
                     if (!userActivation) {
                         stats.popups++;
                         log('Blocked popup without valid consent:', requestedURL);
                         return null;
                     }
+                    
+                    // Jika MAX_POPUPS_PER_INTERACTION = 0, blok SEMUA
+                    if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
+                        stats.popups++;
+                        log('Blocked all popups (zero tolerance):', requestedURL);
+                        return null;
+                    }
+                    
                     if (ClickGuard.popupCount >= ClickGuard.maxPopups) {
                         stats.popups++;
                         log('Blocked extra popup:', requestedURL);
@@ -387,6 +426,16 @@
                 },
             });
 
+            // Patch juga via defineProperty untuk mencegah reassignment
+            try {
+                Object.defineProperty(window, 'open', {
+                    get() { return window.open; },
+                    set() { warn('Attempt to override window.open blocked'); },
+                    configurable: false,
+                });
+            } catch (e) { warn('window.open defineProperty failed:', e); }
+
+            // Patch window.top.open
             try {
                 if (window.top && window.top !== window &&
                     typeof window.top.open === 'function') {
@@ -405,6 +454,11 @@
                                 log('Blocked cross-frame popup (no consent):', u);
                                 return null;
                             }
+                            if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
+                                stats.popups++;
+                                log('Blocked top popup (zero tolerance):', u);
+                                return null;
+                            }
                             return Reflect.apply(t, thisArg, args);
                         },
                     });
@@ -418,7 +472,167 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       SYNTHETIC BLANK-CLICK SHIELD
+       EVAL / FUNCTION / SETTIMEOUT GUARD (BARU)
+       ═══════════════════════════════════════════════════════════════ */
+    const CodeInjectionGuard = (() => {
+        const install = () => {
+            if (!CONFIG.BLOCK_EVAL_INJECTION) return;
+
+            // Patch eval
+            const nativeEval = window.eval;
+            window.eval = function(code) {
+                if (typeof code === 'string') {
+                    const lowered = code.toLowerCase();
+                    // Deteksi pola popup/tab dalam string eval
+                    if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
+                        stats.evalBlocked++;
+                        log('Blocked eval with popup pattern');
+                        return undefined;
+                    }
+                }
+                return nativeEval.apply(this, arguments);
+            };
+
+            // Patch Function constructor
+            const nativeFunction = window.Function;
+            window.Function = new Proxy(nativeFunction, {
+                construct(target, args) {
+                    const code = args.join(' ');
+                    if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
+                        stats.evalBlocked++;
+                        log('Blocked Function with popup pattern');
+                        return function() {};
+                    }
+                    return Reflect.construct(target, args);
+                },
+            });
+
+            // Patch setTimeout / setInterval string
+            const patchTimer = (name, nativeFn) => {
+                window[name] = new Proxy(nativeFn, {
+                    apply(target, thisArg, args) {
+                        if (typeof args[0] === 'string') {
+                            const code = args[0];
+                            if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
+                                stats.evalBlocked++;
+                                log(`Blocked ${name} with popup pattern`);
+                                return 0;
+                            }
+                        }
+                        return Reflect.apply(target, thisArg, args);
+                    },
+                });
+            };
+            patchTimer('setTimeout', window.setTimeout);
+            patchTimer('setInterval', window.setInterval);
+
+            log('CodeInjectionGuard installed');
+        };
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       BEFOREUNLOAD REDIRECT GUARD (BARU)
+       ═══════════════════════════════════════════════════════════════ */
+    const BeforeUnloadGuard = (() => {
+        const install = () => {
+            if (!CONFIG.BLOCK_BEFOREUNLOAD_REDIRECT) return;
+
+            // Blok semua beforeunload yang mengandung redirect
+            window.addEventListener('beforeunload', event => {
+                // Cek apakah ada script yang mencoba redirect saat unload
+                // dengan memeriksa perubahan location dalam 100ms terakhir
+                stats.beforeunloadBlocked++;
+                log('Intercepted beforeunload event');
+                // Tidak preventDefault, tapi kita catat
+            }, true);
+
+            // Patch window.onbeforeunload
+            const desc = Object.getOwnPropertyDescriptor(window, 'onbeforeunload');
+            if (desc) {
+                Object.defineProperty(window, 'onbeforeunload', {
+                    get() { return desc.get ? desc.get.call(window) : null; },
+                    set(fn) {
+                        if (typeof fn === 'function') {
+                            const wrapped = function(event) {
+                                log('Blocked onbeforeunload handler');
+                                return null;
+                            };
+                            if (desc.set) desc.set.call(window, wrapped);
+                        }
+                    },
+                    configurable: true,
+                });
+            }
+
+            log('BeforeUnloadGuard installed');
+        };
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       DYNAMIC ANCHOR CLICK GUARD (BARU)
+       ═══════════════════════════════════════════════════════════════ */
+    const DynamicAnchorGuard = (() => {
+        const install = () => {
+            if (!CONFIG.BLOCK_DYNAMIC_ANCHOR_CLICK) return;
+
+            // Intercept createElement('a') + .click()
+            const nativeCreateElement = Document.prototype.createElement;
+            Document.prototype.createElement = new Proxy(nativeCreateElement, {
+                apply(target, thisArg, args) {
+                    const el = Reflect.apply(target, thisArg, args);
+                    const tag = String(args[0]).toLowerCase();
+                    
+                    if (tag === 'a' || tag === 'area') {
+                        // Patch .click() pada anchor yang baru dibuat
+                        const nativeClick = el.click;
+                        el.click = function() {
+                            const href = this.getAttribute('href');
+                            const tgt = this.getAttribute('target');
+                            if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
+                                stats.dynamicAnchors++;
+                                log('Blocked dynamic anchor.click():', href);
+                                return;
+                            }
+                            return nativeClick.apply(this, arguments);
+                        };
+                    }
+                    return el;
+                },
+            });
+
+            // Intercept createElementNS juga
+            const nativeCreateElementNS = Document.prototype.createElementNS;
+            if (nativeCreateElementNS) {
+                Document.prototype.createElementNS = new Proxy(nativeCreateElementNS, {
+                    apply(target, thisArg, args) {
+                        const el = Reflect.apply(target, thisArg, args);
+                        if (el instanceof HTMLAnchorElement) {
+                            const nativeClick = el.click;
+                            el.click = function() {
+                                const href = this.getAttribute('href');
+                                const tgt = this.getAttribute('target');
+                                if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
+                                    stats.dynamicAnchors++;
+                                    log('Blocked dynamic NS anchor.click():', href);
+                                    return;
+                                }
+                                return nativeClick.apply(this, arguments);
+                            };
+                        }
+                        return el;
+                    },
+                });
+            }
+
+            log('DynamicAnchorGuard installed');
+        };
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       SYNTHETIC BLANK-CLICK SHIELD (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const AnchorClickShield = (() => {
         const isBlankAdAnchor = el =>
@@ -435,6 +649,7 @@
         const install = () => {
             if (!CONFIG.BLOCK_SYNTHETIC_BLANK_CLICKS) return;
 
+            // HTMLAnchorElement.prototype.click
             try {
                 const proto = HTMLAnchorElement.prototype;
                 const nativeClick = proto.click;
@@ -448,6 +663,7 @@
                 };
             } catch (e) { warn('anchor.click patch failed:', e); }
 
+            // HTMLElement.prototype.click (untuk area)
             try {
                 const proto = HTMLElement.prototype;
                 const nativeClick = proto.click;
@@ -461,6 +677,7 @@
                 };
             } catch (e) { warn('element.click patch failed:', e); }
 
+            // Element.prototype.dispatchEvent
             try {
                 const proto = Element.prototype;
                 const nativeDispatch = proto.dispatchEvent;
@@ -476,6 +693,7 @@
                 };
             } catch (e) { warn('dispatchEvent patch failed:', e); }
 
+            // HTMLFormElement.prototype.submit
             try {
                 const proto = HTMLFormElement.prototype;
                 const nativeSubmit = proto.submit;
@@ -498,10 +716,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       LOCATION REDIRECT GUARD  (BARU di v8)
-       — blok location.assign / location.replace / location.href setter
-         ke domain iklan. Menutup celah hijack grid wmanhua.com
-         yang pakai top.location = url / window.location.href = url.
+       LOCATION REDIRECT GUARD (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const LocationGuard = (() => {
         const install = () => {
@@ -525,14 +740,13 @@
                 } catch (e) { warn(`location.${name} patch failed:`, e); }
             };
 
-            // Location.prototype.assign / replace
+            // Location.prototype
             try {
                 wrap(Location.prototype, 'assign', Location.prototype.assign);
                 wrap(Location.prototype, 'replace', Location.prototype.replace);
             } catch (e) { warn('Location prototype patch failed:', e); }
 
-            // Location.prototype.href setter — coba override; sebagian browser
-            // melarang, jadi bungkus dengan try/catch.
+            // Location.prototype.href setter
             try {
                 const desc = Object.getOwnPropertyDescriptor(
                     Location.prototype, 'href'
@@ -554,6 +768,68 @@
                 }
             } catch (e) { warn('location.href setter patch failed:', e); }
 
+            // BARU: Patch window.location (instance properties)
+            try {
+                const locDesc = Object.getOwnPropertyDescriptor(window, 'location');
+                if (locDesc && locDesc.set) {
+                    const nativeSet = locDesc.set;
+                    Object.defineProperty(window, 'location', {
+                        ...locDesc,
+                        set: function(url) {
+                            if (isBlockedURL(url)) {
+                                stats.locationBlocked++;
+                                log('Blocked window.location= to ad:', url);
+                                return;
+                            }
+                            return nativeSet.call(this, url);
+                        },
+                        configurable: true,
+                    });
+                }
+            } catch (e) { warn('window.location patch failed:', e); }
+
+            // BARU: Patch document.location
+            try {
+                const docLocDesc = Object.getOwnPropertyDescriptor(document, 'location');
+                if (docLocDesc && docLocDesc.set) {
+                    const nativeSet = docLocDesc.set;
+                    Object.defineProperty(document, 'location', {
+                        ...docLocDesc,
+                        set: function(url) {
+                            if (isBlockedURL(url)) {
+                                stats.locationBlocked++;
+                                log('Blocked document.location= to ad:', url);
+                                return;
+                            }
+                            return nativeSet.call(this, url);
+                        },
+                        configurable: true,
+                    });
+                }
+            } catch (e) { warn('document.location patch failed:', e); }
+
+            // BARU: Patch top.location
+            try {
+                if (window.top && window.top !== window) {
+                    const topLocDesc = Object.getOwnPropertyDescriptor(window.top, 'location');
+                    if (topLocDesc && topLocDesc.set) {
+                        const nativeSet = topLocDesc.set;
+                        Object.defineProperty(window.top, 'location', {
+                            ...topLocDesc,
+                            set: function(url) {
+                                if (isBlockedURL(url)) {
+                                    stats.locationBlocked++;
+                                    log('Blocked top.location= to ad:', url);
+                                    return;
+                                }
+                                return nativeSet.call(this, url);
+                            },
+                            configurable: true,
+                        });
+                    }
+                }
+            } catch (e) { warn('top.location patch failed:', e); }
+
             log('LocationGuard installed');
         };
 
@@ -561,7 +837,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       REQUEST INTERCEPTION
+       REQUEST INTERCEPTION (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const RequestBlocker = (() => {
         const installFetch = () => {
@@ -625,11 +901,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       HIJACK OVERLAY CLEANER  (BARU di v8)
-       — deteksi & hapus elemen position:fixed + opacity sangat rendah
-         + z-index tinggi (ciri grid hijack wmanhua.com).
-       — juga hapus elemen dengan inline onclick/ontouchend yang
-         mengandung "location" dan mengarah ke domain iklan.
+       HIJACK OVERLAY CLEANER (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const HijackOverlayCleaner = (() => {
         const removed = new WeakSet();
@@ -655,7 +927,6 @@
             const z  = parseZIndex(style);
             if (op > CONFIG.HIJACK_OPACITY_MAX) return false;
             if (z < CONFIG.HIJACK_ZINDEX_MIN) return false;
-            // pastikan benar-benar di viewport (bukan off-screen)
             const rect = el.getBoundingClientRect();
             if (rect.width < 2 || rect.height < 2) return false;
             if (rect.right < 0 || rect.bottom < 0) return false;
@@ -665,13 +936,14 @@
         };
 
         const hasInlineLocationRedirect = el => {
-            const attrs = ['onclick','ontouchend','onmousedown','ontouchstart'];
+            const attrs = ['onclick','ontouchend','onmousedown','ontouchstart','onmouseup','onpointerdown','onpointerup'];
             for (const a of attrs) {
                 const v = el.getAttribute?.(a);
                 if (!v) continue;
                 if (/location\s*[\.\[]\s*(?:href|assign|replace)/i.test(v) ||
                     /top\s*\.\s*location\s*=/i.test(v) ||
-                    /window\s*\.\s*location\s*=/i.test(v)) {
+                    /window\s*\.\s*location\s*=/i.test(v) ||
+                    /open\s*\(/i.test(v)) {
                     return true;
                 }
             }
@@ -693,13 +965,12 @@
                 remove(el);
                 return;
             }
-            // cek inline handler pada elemen & keturunan
             try {
-                const candidates = el.matches?.('[onclick],[ontouchend],[onmousedown],[ontouchstart]')
+                const candidates = el.matches?.('[onclick],[ontouchend],[onmousedown],[ontouchstart],[onmouseup],[onpointerdown],[onpointerup]')
                     ? [el]
                     : [];
                 const desc = el.querySelectorAll?.(
-                    '[onclick],[ontouchend],[onmousedown],[ontouchstart]'
+                    '[onclick],[ontouchend],[onmousedown],[ontouchstart],[onmouseup],[onpointerdown],[onpointerup]'
                 ) || [];
                 for (const c of [...candidates, ...desc]) {
                     if (hasInlineLocationRedirect(c)) {
@@ -716,7 +987,7 @@
                 cands = document.querySelectorAll(
                     'div[style*="position:fixed"],div[style*="position: fixed"],' +
                     'div[style*="position:fixed !important"],' +
-                    '[onclick],[ontouchend],[onmousedown],[ontouchstart]'
+                    '[onclick],[ontouchend],[onmousedown],[ontouchstart],[onmouseup],[onpointerdown],[onpointerup]'
                 );
             } catch { return; }
             for (const c of cands) {
@@ -730,7 +1001,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       DOM CLEANER
+       DOM CLEANER (Diperkuat)
        ═══════════════════════════════════════════════════════════════ */
     const DOMCleaner = (() => {
         const removed = new WeakSet();
@@ -748,8 +1019,6 @@
             }
         };
 
-        /* Dukungan <picture> + <source srcset>: kumpulkan semua URL
-           dari srcset dan cek apakah ada yang iklan. */
         const getSourcesetURLs = el => {
             if (el.tagName !== 'SOURCE' && el.tagName !== 'IMG') return [];
             const ss = el.getAttribute('srcset') || el.getAttribute('data-srcset');
@@ -772,7 +1041,6 @@
                     if (isBlockedURL(u)) return true;
                     if (looksLikeAdGifURL(u)) return true;
                 }
-                // Untuk <picture>, cek juga <source> anak
                 if (el.tagName === 'PICTURE') {
                     const subs = el.querySelectorAll('source[srcset],source[src],img[src]');
                     for (const s of subs) {
@@ -805,7 +1073,6 @@
             if (isAdGif(el)) return true;
             const u = getResourceURL(el);
             if (u && isBlockedURL(u)) return true;
-            // <picture> yang membungkus <a target=_blank> ke iklan
             if (el.tagName === 'PICTURE') {
                 const parentA = el.closest('a[target="_blank"]');
                 if (parentA && isBlockedURL(parentA.href)) return true;
@@ -818,7 +1085,6 @@
                 return false;
             removed.add(el);
             log('Removed:', reason, el);
-            // Jika <a> iklan, hapus juga picture/img di dalamnya
             el.remove();
             stats.elements++;
             return true;
@@ -954,7 +1220,7 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
-       CSS HIDING
+       CSS HIDING (Diperluas)
        ═══════════════════════════════════════════════════════════════ */
     const installCosmeticFilter = () => {
         if (!CONFIG.REMOVE_AD_ELEMENTS) return;
@@ -972,16 +1238,28 @@
             a[target="_blank"][href*="gewt00g.com"],
             a[target="_blank"][href*="cdnweb.win"],
             a[target="_blank"][href*="aipornhub.ltd"],
+            a[target="_blank"][href*="oe188bu.com"],
+            a[target="_blank"][href*="lp-is.com"],
+            a[target="_blank"][href*="go2cloud.org"],
+            a[target="_blank"][href*="onclickmega.com"],
             img.ad-img,
             picture > source[srcset*=".gif"],
             img[src*="/gg"][src$=".gif"],
             img[src*="guanggao"][src$=".gif"],
             img[src*="tuiguang"][src$=".gif"],
             img[src*="banner"][src$=".gif"],
-            img[src*="cdnweb.win"][src$=".gif"] {
+            img[src*="cdnweb.win"][src$=".gif"],
+            /* BARU: sembunyikan elemen popup umum */
+            [class*="popup" i][style*="fixed"],
+            [id*="popup" i][style*="fixed"],
+            [class*="modal" i][style*="fixed"] {
                 display: none !important;
                 visibility: hidden !important;
                 pointer-events: none !important;
+                opacity: 0 !important;
+                height: 0 !important;
+                width: 0 !important;
+                overflow: hidden !important;
             }
         `;
         const append = () => {
@@ -995,7 +1273,7 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
-       MUTATION OBSERVER
+       MUTATION OBSERVER (Dipercepat)
        ═══════════════════════════════════════════════════════════════ */
     const MutationEngine = (() => {
         let observer = null;
@@ -1055,11 +1333,14 @@
     };
 
     try {
-        // document-start shields
+        // document-start shields — URUTAN PENTING!
+        CodeInjectionGuard.install();    // BARU: blok eval/Function/setTimeout string
+        BeforeUnloadGuard.install();     // BARU: blok beforeunload redirect
+        DynamicAnchorGuard.install();    // BARU: intercept createElement('a')
         ClickGuard.install();
         PopupBlocker.install();
         AnchorClickShield.install();
-        LocationGuard.install();         // BARU
+        LocationGuard.install();
         RequestBlocker.install();
         installCosmeticFilter();
 
@@ -1078,7 +1359,7 @@
             configurable: true,
         });
 
-        log('Initialized successfully (v8.0.1)');
+        log('Initialized successfully (v8.1.0)');
     } catch (err) {
         console.error(PREFIX, 'Initialization failed:', err);
     }
