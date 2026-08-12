@@ -1,15 +1,17 @@
 // ==UserScript==
-// @name         Popup & Ad Blocker Pro — China-Enhanced v8.1
+// @name         Popup & Ad Blocker Pro — China-Enhanced v9
 // @namespace    http://tampermonkey.net/
-// @version      8.1.0
-// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (FIXED: tab leaks, dynamic anchors, eval injection, beforeunload hijack)
+// @version      9.0.0
+// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (FIXED: recursive getter, realm iframe, allowlist approach)
 // @author       Mochizhouuu
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
-// @updateURL    https://raw.githubusercontent.com/Mochizhouuu/Adblock-userscript/refs/heads/main/index.user.js
-// @downloadURL  https://raw.githubusercontent.com/Mochizhouuu/Adblock-userscript/refs/heads/main/index.user.js
 // @license      MIT
+// @homepageURL  https://github.com/Mochizhouuu/Adblock-userscript
+// @supportURL   https://github.com/Mochizhouuu/Adblock-userscript/issues
+// @updateURL    https://raw.githubusercontent.com/Mochizhouuu/Adblock-userscript/main/index.user.js
+// @downloadURL  https://raw.githubusercontent.com/Mochizhouuu/Adblock-userscript/main/index.user.js
 // ==/UserScript==
 
 (() => {
@@ -21,14 +23,17 @@
     const CONFIG = Object.freeze({
         DEBUG: false,
 
+        // ── Core blocking ──
         BLOCK_POPUPS: true,
         BLOCK_AD_REQUESTS: true,
         BLOCK_TRACKERS: true,
 
+        // ── DOM cleanup ──
         REMOVE_AD_ELEMENTS: true,
         REMOVE_ANTI_ADBLOCK_OVERLAYS: true,
         REMOVE_META_REDIRECTS_TO_ADS: true,
 
+        // ── Hijack protection ──
         HIJACK_GUARD: true,
         BLOCK_SYNTHETIC_BLANK_CLICKS: true,
         BLOCK_BLANK_ANCHORS_TO_ADS: true,
@@ -37,17 +42,25 @@
         BLOCK_AD_LOCATION_REDIRECTS: true,
         REMOVE_HIJACK_OVERLAYS: true,
 
-        // BARU: proteksi tambahan
-        BLOCK_EVAL_INJECTION: true,
-        BLOCK_BEFOREUNLOAD_REDIRECT: true,
-        BLOCK_DYNAMIC_ANCHOR_CLICK: true,
-        BLOCK_AUXCLICK: true,
+        // ── NEW: iframe realm patching ──
+        PATCH_IFRAME_REALM: true,
+        SANDBOX_NEW_IFRAMES: true,
 
-        MAX_POPUPS_PER_INTERACTION: 0,  // Diubah: 0 = blok SEMUA popup/tab baru
+        // ── NEW: allowlist approach for images ──
+        USE_IMAGE_ALLOWLIST: true,
+
+        // ── REMOVED: dangerous eval/Function patching ──
+        // BLOCK_EVAL_INJECTION: false,
+        // BLOCK_BEFOREUNLOAD_REDIRECT: false,
+        // BLOCK_DYNAMIC_ANCHOR_CLICK: false,
+
+        // ── Popup tolerance ──
+        MAX_POPUPS_PER_INTERACTION: 0,  // 0 = block ALL
         USER_ACTIVATION_WINDOW_MS: 1500,
-        CLEANUP_INTERVAL_MS: 3000,      // Dipercepat
+        CLEANUP_INTERVAL_MS: 2000,
 
-        HIJACK_OPACITY_MAX: 0.15,       // Dinaikkan sedikit
+        // ── Overlay detection ──
+        HIJACK_OPACITY_MAX: 0.15,
         HIJACK_ZINDEX_MIN: 5,
     });
 
@@ -56,7 +69,7 @@
     const warn = (...a) => CONFIG.DEBUG && console.warn(PREFIX, ...a);
 
     /* ═══════════════════════════════════════════════════════════════
-       DOMAIN LISTS (Diperluas)
+       DOMAIN LISTS
        ═══════════════════════════════════════════════════════════════ */
     const AD_DOMAINS = new Set([
         // — Global
@@ -89,9 +102,9 @@
         'oe188bu.com','lp-is.com',
         '8ox.cn','papa.me','meimanhua.com','mh1234.com',
         'fxxkwg.com','kmyay.com','wenku8.com',
-        
-        // — Tambahan: domain popup umum di situs manga China
-        'go2cloud.org','go2affise.com','offergo','clcktrax.com',
+
+        // — Popup/redirect domains umum
+        'go2cloud.org','go2affise.com','clcktrax.com',
         'onclickmega.com','pushmejs.com','pushlaram.com','notifpush.com',
         'push-notifications.top','pushnott.com','pushengage.com',
         'bidgear.com','adplus.co.id','adplus.id','adnety.com',
@@ -103,7 +116,7 @@
         'intellitxt.com','kontera.com','linkbucks.com',
         'maxbounty.com','mobidea.com','mylead.global',
         'performancehorizon.com','redirectvoluum.com',
-        'revcontent.com','smartadserver.com','spotxchange.com',
+        'smartadserver.com','spotxchange.com',
         'tribalfusion.com','zedo.com','zergnet.com',
     ]);
 
@@ -121,11 +134,22 @@
         'googletagmanager.com','instant.page',
     ]);
 
+    // ── NEW: Image allowlist for wmanhua.com ──
+    // These are the legitimate image hosts for the comic site
+    // Add more as needed based on Network tab inspection
+    const IMAGE_ALLOWLIST = new Set([
+        // wmanhua.com itself
+        'www.wmanhua.com',
+        'wmanhua.com',
+        // Common CDN hosts for manga sites (add based on actual site)
+        // Leave empty to auto-detect from page resources
+    ]);
+
     /* ═══════════════════════════════════════════════════════════════
-       AD SELECTORS (Diperluas)
+       AD SELECTORS (Cleaned - removed dangerous broad selectors)
        ═══════════════════════════════════════════════════════════════ */
     const AD_SELECTORS = [
-        // — Global
+        // — Global ad containers
         'ins.adsbygoogle','.adsbygoogle','[data-ad-client]','[data-ad-slot]',
         '[data-ad-unit]','[data-ad-zone]',
         '#ad-container','#ad-wrapper','#ad-banner','#ad-slot','#advertisement',
@@ -139,16 +163,9 @@
         '.taboola','.taboola-container','.outbrain','.OUTBRAIN','.revcontent',
         '.mgid','.adskeeper',
 
-        // — Spesifik ditemukan di wmanhua.com & situs manga China
-        '.ad-img',
-        'a[target="_blank"] > picture',
-        'picture > source[srcset*=".gif"]',
-
         // — Inline handler redirect ke location
-        '[onclick*="location"]',
-        '[ontouchend*="location"]',
-        '[onmousedown*="location"]',
-        '[ontouchstart*="location"]',
+        '[onclick*="location"]','[ontouchend*="location"]',
+        '[onmousedown*="location"]','[ontouchstart*="location"]',
 
         // — Discuz! forum ads
         '.a_fl','.a_fr','.a_mu','.a_pb','.a_pt','.a_cn','.a_oscar1','.a_ssk_cn',
@@ -229,14 +246,6 @@
         '#syad','#syad1','#syad2','#syad3','#syad4','#syad5','#syad6',
         '#textggs','#timedfuo','#top-gg-container','#top_ads0','#xinnxi',
         '#xqad','#xqad1','#xqad2','#xqad3','#left-promotion','#right-promotion',
-        
-        // — BARU: selector tambahan untuk wmanhua.com
-        '[class*="popup" i]','[id*="popup" i]',
-        '[class*="popunder" i]','[id*="popunder" i]',
-        '[class*="onclick" i]','[id*="onclick" i]',
-        '[class*="overlay" i][style*="fixed"]',
-        '[class*="modal" i][style*="fixed"]',
-        '[class*="hijack" i]','[id*="hijack" i]',
     ];
     const AD_SELECTOR = AD_SELECTORS.join(',');
 
@@ -265,7 +274,7 @@
         popups: 0, requests: 0, elements: 0, overlays: 0,
         metaRedirects: 0, hijacks: 0, syntheticClicks: 0, blankAnchors: 0,
         gifs: 0, iframes: 0, locationBlocked: 0, hijackOverlays: 0,
-        evalBlocked: 0, dynamicAnchors: 0, beforeunloadBlocked: 0,
+        realmPatches: 0, sandboxedIframes: 0,
     };
 
     /* ═══════════════════════════════════════════════════════════════
@@ -310,160 +319,184 @@
                ua.pathname === ub.pathname && ua.search === ub.search;
     };
 
+    // ── NEW: Check if image host is NOT in allowlist ──
+    const isImageHostBlocked = url => {
+        if (!CONFIG.USE_IMAGE_ALLOWLIST) return false;
+        const p = normalizeURL(url);
+        if (!p) return false;
+        // Auto-populate allowlist with current page hostname
+        IMAGE_ALLOWLIST.add(location.hostname);
+        // Also add www variant
+        if (location.hostname.startsWith('www.')) {
+            IMAGE_ALLOWLIST.add(location.hostname.slice(4));
+        } else {
+            IMAGE_ALLOWLIST.add('www.' + location.hostname);
+        }
+        return !Array.from(IMAGE_ALLOWLIST).some(h => hostnameMatches(p.hostname, h));
+    };
+
     /* ═══════════════════════════════════════════════════════════════
-       CLICK GUARD (Diperkuat)
+       REALM PATCHER (NEW - fixes iframe bypass)
        ═══════════════════════════════════════════════════════════════ */
-    const ClickGuard = (() => {
-        let lastTrustedClick = null;
-        let popupCount = 0;
+    const RealmPatcher = (() => {
+        const patched = new WeakSet();
 
-        const onCaptureClick = event => {
-            if (!event.isTrusted) return;
-            const target = event.target;
-            const anchor =
-                target instanceof HTMLAnchorElement ? target :
-                target?.closest?.('a[href]');
-            lastTrustedClick = {
-                time: performance.now(),
-                target,
-                href: anchor?.getAttribute('href') || null,
-                isAnchor: !!anchor,
-            };
-            popupCount = 0;
+        const patchRealm = w => {
+            try {
+                if (!w || w.__aab || patched.has(w)) return;
+                patched.add(w);
+                w.__aab = 1;
 
-            if (CONFIG.BLOCK_BLANK_ANCHORS_TO_ADS && anchor) {
-                const tgt = anchor.getAttribute('target');
-                if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(anchor.href)) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    stats.popups++;
-                    log('Blocked trusted click to ad anchor:', anchor.href);
+                // Block window.open in realm
+                if (w.open && typeof w.open === 'function') {
+                    const native = w.open;
+                    w.open = function(...args) {
+                        const url = args[0];
+                        if (url && isBlockedURL(url)) {
+                            stats.popups++;
+                            log('Blocked realm popup:', url);
+                            return null;
+                        }
+                        // Block all cross-origin popups without consent
+                        return null; // Zero tolerance
+                    };
                 }
-            }
+
+                // Block anchor clicks in realm
+                const P = w.HTMLAnchorElement?.prototype;
+                if (P) {
+                    const nativeClick = P.click;
+                    P.click = function() {
+                        const tgt = this.getAttribute('target');
+                        const href = this.getAttribute('href');
+                        if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
+                            stats.syntheticClicks++;
+                            log('Blocked realm anchor.click():', href);
+                            return;
+                        }
+                        return nativeClick.apply(this, arguments);
+                    };
+                }
+
+                stats.realmPatches++;
+                log('Patched realm:', w.location?.href || 'unknown');
+            } catch (e) { warn('Realm patch failed:', e); }
         };
 
         const install = () => {
-            // Tangkap SEMUA event klik
-            document.addEventListener('click', onCaptureClick, true);
-            document.addEventListener('pointerdown', onCaptureClick, true);
-            document.addEventListener('touchstart', onCaptureClick, true);
-            // BARU: tangkap auxclick (middle click, right click programmatic)
-            if (CONFIG.BLOCK_AUXCLICK) {
-                document.addEventListener('auxclick', onCaptureClick, true);
-            }
-            log('ClickGuard installed');
+            if (!CONFIG.PATCH_IFRAME_REALM) return;
+
+            try {
+                const d = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+                if (!d || !d.get) {
+                    warn('contentWindow getter not found');
+                    return;
+                }
+
+                Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                    get() {
+                        const w = d.get.call(this);
+                        patchRealm(w);
+                        return w;
+                    },
+                    configurable: true,
+                });
+
+                // Also patch contentDocument
+                const dd = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentDocument');
+                if (dd && dd.get) {
+                    Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', {
+                        get() {
+                            const doc = dd.get.call(this);
+                            if (doc && doc.defaultView) patchRealm(doc.defaultView);
+                            return doc;
+                        },
+                        configurable: true,
+                    });
+                }
+
+                log('RealmPatcher installed');
+            } catch (e) { warn('RealmPatcher install failed:', e); }
         };
 
-        const isPopupConsentValid = popupURL => {
-            if (!lastTrustedClick) return false;
-            const recent =
-                performance.now() - lastTrustedClick.time <=
-                CONFIG.USER_ACTIVATION_WINDOW_MS;
-            if (!recent) return false;
-            const browserActivation =
-                navigator.userActivation?.isActive === true;
-            const { isAnchor, href } = lastTrustedClick;
-            if (isAnchor && href && urlEquals(href, popupURL)) return true;
-            if (isAnchor && href && !urlEquals(href, popupURL)) return false;
-            return browserActivation;
-        };
-
-        const bumpPopup = () => { popupCount++; };
-
-        return {
-            install, isPopupConsentValid, bumpPopup,
-            get popupCount() { return popupCount; },
-            get maxPopups() { return CONFIG.MAX_POPUPS_PER_INTERACTION; },
-        };
+        return { install, patchRealm };
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       POPUP BLOCKER (Diperkuat — blok SEMUA popup)
+       IFRAME SANDBOXER (NEW)
+       ═══════════════════════════════════════════════════════════════ */
+    const IframeSandboxer = (() => {
+        const sandboxed = new WeakSet();
+
+        const sandbox = iframe => {
+            if (sandboxed.has(iframe)) return;
+            if (iframe.hasAttribute('sandbox')) return;
+
+            // Don't sandbox same-origin iframes that might be needed
+            const src = iframe.getAttribute('src');
+            if (src) {
+                const p = normalizeURL(src);
+                if (p && p.hostname === location.hostname) return;
+            }
+
+            try {
+                iframe.setAttribute('sandbox', 'allow-scripts allow-forms');
+                sandboxed.add(iframe);
+                stats.sandboxedIframes++;
+                log('Sandboxed iframe:', src || 'no-src');
+            } catch (e) { warn('Sandbox failed:', e); }
+        };
+
+        return { sandbox };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       POPUP BLOCKER (FIXED - no recursive getter)
        ═══════════════════════════════════════════════════════════════ */
     const PopupBlocker = (() => {
         const nativeOpen = window.open;
 
+        // Create proxy ONCE and store in local variable
+        const proxiedOpen = new Proxy(nativeOpen, {
+            apply(target, thisArg, args) {
+                const requestedURL = args[0];
+
+                if (requestedURL && isBlockedURL(requestedURL)) {
+                    stats.popups++;
+                    log('Blocked ad-domain popup:', requestedURL);
+                    return null;
+                }
+
+                const userActivation =
+                    navigator.userActivation?.isActive === true;
+
+                if (!userActivation) {
+                    stats.popups++;
+                    log('Blocked popup without consent:', requestedURL);
+                    return null;
+                }
+
+                if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
+                    stats.popups++;
+                    log('Blocked all popups (zero tolerance):', requestedURL);
+                    return null;
+                }
+
+                return Reflect.apply(target, thisArg, args);
+            },
+        });
+
         const install = () => {
             if (!CONFIG.BLOCK_POPUPS || typeof nativeOpen !== 'function') return;
 
-            // Simpan referensi asli dengan nama acak untuk mencegah bypass
-            const _nativeOpen = nativeOpen;
+            // Simply assign the proxy - no defineProperty with recursive getter
+            window.open = proxiedOpen;
 
-            window.open = new Proxy(_nativeOpen, {
-                apply(target, thisArg, args) {
-                    const requestedURL = args[0];
-                    
-                    // Blok SEMUA popup ke domain iklan
-                    if (requestedURL && isBlockedURL(requestedURL)) {
-                        stats.popups++;
-                        log('Blocked ad-domain popup:', requestedURL);
-                        return null;
-                    }
-                    
-                    // Blok SEMUA popup tanpa user activation
-                    const userActivation =
-                        navigator.userActivation?.isActive === true ||
-                        ClickGuard.isPopupConsentValid(requestedURL);
-                    
-                    if (!userActivation) {
-                        stats.popups++;
-                        log('Blocked popup without valid consent:', requestedURL);
-                        return null;
-                    }
-                    
-                    // Jika MAX_POPUPS_PER_INTERACTION = 0, blok SEMUA
-                    if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
-                        stats.popups++;
-                        log('Blocked all popups (zero tolerance):', requestedURL);
-                        return null;
-                    }
-                    
-                    if (ClickGuard.popupCount >= ClickGuard.maxPopups) {
-                        stats.popups++;
-                        log('Blocked extra popup:', requestedURL);
-                        return null;
-                    }
-                    ClickGuard.bumpPopup();
-                    return Reflect.apply(target, thisArg, args);
-                },
-            });
-
-            // Patch juga via defineProperty untuk mencegah reassignment
-            try {
-                Object.defineProperty(window, 'open', {
-                    get() { return window.open; },
-                    set() { warn('Attempt to override window.open blocked'); },
-                    configurable: false,
-                });
-            } catch (e) { warn('window.open defineProperty failed:', e); }
-
-            // Patch window.top.open
+            // Also patch top.open
             try {
                 if (window.top && window.top !== window &&
                     typeof window.top.open === 'function') {
-                    const nativeTopOpen = window.top.open;
-                    window.top.open = new Proxy(nativeTopOpen, {
-                        apply(t, thisArg, args) {
-                            const u = args[0];
-                            if (u && isBlockedURL(u)) {
-                                stats.popups++;
-                                log('Blocked cross-frame popup:', u);
-                                return null;
-                            }
-                            if (!ClickGuard.isPopupConsentValid(u) &&
-                                navigator.userActivation?.isActive !== true) {
-                                stats.popups++;
-                                log('Blocked cross-frame popup (no consent):', u);
-                                return null;
-                            }
-                            if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
-                                stats.popups++;
-                                log('Blocked top popup (zero tolerance):', u);
-                                return null;
-                            }
-                            return Reflect.apply(t, thisArg, args);
-                        },
-                    });
+                    window.top.open = proxiedOpen;
                 }
             } catch (err) { warn('Cannot patch top.open:', err); }
 
@@ -474,167 +507,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       EVAL / FUNCTION / SETTIMEOUT GUARD (BARU)
-       ═══════════════════════════════════════════════════════════════ */
-    const CodeInjectionGuard = (() => {
-        const install = () => {
-            if (!CONFIG.BLOCK_EVAL_INJECTION) return;
-
-            // Patch eval
-            const nativeEval = window.eval;
-            window.eval = function(code) {
-                if (typeof code === 'string') {
-                    const lowered = code.toLowerCase();
-                    // Deteksi pola popup/tab dalam string eval
-                    if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
-                        stats.evalBlocked++;
-                        log('Blocked eval with popup pattern');
-                        return undefined;
-                    }
-                }
-                return nativeEval.apply(this, arguments);
-            };
-
-            // Patch Function constructor
-            const nativeFunction = window.Function;
-            window.Function = new Proxy(nativeFunction, {
-                construct(target, args) {
-                    const code = args.join(' ');
-                    if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
-                        stats.evalBlocked++;
-                        log('Blocked Function with popup pattern');
-                        return function() {};
-                    }
-                    return Reflect.construct(target, args);
-                },
-            });
-
-            // Patch setTimeout / setInterval string
-            const patchTimer = (name, nativeFn) => {
-                window[name] = new Proxy(nativeFn, {
-                    apply(target, thisArg, args) {
-                        if (typeof args[0] === 'string') {
-                            const code = args[0];
-                            if (/window\.open|\.click\(\)|location\.href|location\.assign|location\.replace/.test(code)) {
-                                stats.evalBlocked++;
-                                log(`Blocked ${name} with popup pattern`);
-                                return 0;
-                            }
-                        }
-                        return Reflect.apply(target, thisArg, args);
-                    },
-                });
-            };
-            patchTimer('setTimeout', window.setTimeout);
-            patchTimer('setInterval', window.setInterval);
-
-            log('CodeInjectionGuard installed');
-        };
-        return { install };
-    })();
-
-    /* ═══════════════════════════════════════════════════════════════
-       BEFOREUNLOAD REDIRECT GUARD (BARU)
-       ═══════════════════════════════════════════════════════════════ */
-    const BeforeUnloadGuard = (() => {
-        const install = () => {
-            if (!CONFIG.BLOCK_BEFOREUNLOAD_REDIRECT) return;
-
-            // Blok semua beforeunload yang mengandung redirect
-            window.addEventListener('beforeunload', event => {
-                // Cek apakah ada script yang mencoba redirect saat unload
-                // dengan memeriksa perubahan location dalam 100ms terakhir
-                stats.beforeunloadBlocked++;
-                log('Intercepted beforeunload event');
-                // Tidak preventDefault, tapi kita catat
-            }, true);
-
-            // Patch window.onbeforeunload
-            const desc = Object.getOwnPropertyDescriptor(window, 'onbeforeunload');
-            if (desc) {
-                Object.defineProperty(window, 'onbeforeunload', {
-                    get() { return desc.get ? desc.get.call(window) : null; },
-                    set(fn) {
-                        if (typeof fn === 'function') {
-                            const wrapped = function(event) {
-                                log('Blocked onbeforeunload handler');
-                                return null;
-                            };
-                            if (desc.set) desc.set.call(window, wrapped);
-                        }
-                    },
-                    configurable: true,
-                });
-            }
-
-            log('BeforeUnloadGuard installed');
-        };
-        return { install };
-    })();
-
-    /* ═══════════════════════════════════════════════════════════════
-       DYNAMIC ANCHOR CLICK GUARD (BARU)
-       ═══════════════════════════════════════════════════════════════ */
-    const DynamicAnchorGuard = (() => {
-        const install = () => {
-            if (!CONFIG.BLOCK_DYNAMIC_ANCHOR_CLICK) return;
-
-            // Intercept createElement('a') + .click()
-            const nativeCreateElement = Document.prototype.createElement;
-            Document.prototype.createElement = new Proxy(nativeCreateElement, {
-                apply(target, thisArg, args) {
-                    const el = Reflect.apply(target, thisArg, args);
-                    const tag = String(args[0]).toLowerCase();
-                    
-                    if (tag === 'a' || tag === 'area') {
-                        // Patch .click() pada anchor yang baru dibuat
-                        const nativeClick = el.click;
-                        el.click = function() {
-                            const href = this.getAttribute('href');
-                            const tgt = this.getAttribute('target');
-                            if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
-                                stats.dynamicAnchors++;
-                                log('Blocked dynamic anchor.click():', href);
-                                return;
-                            }
-                            return nativeClick.apply(this, arguments);
-                        };
-                    }
-                    return el;
-                },
-            });
-
-            // Intercept createElementNS juga
-            const nativeCreateElementNS = Document.prototype.createElementNS;
-            if (nativeCreateElementNS) {
-                Document.prototype.createElementNS = new Proxy(nativeCreateElementNS, {
-                    apply(target, thisArg, args) {
-                        const el = Reflect.apply(target, thisArg, args);
-                        if (el instanceof HTMLAnchorElement) {
-                            const nativeClick = el.click;
-                            el.click = function() {
-                                const href = this.getAttribute('href');
-                                const tgt = this.getAttribute('target');
-                                if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
-                                    stats.dynamicAnchors++;
-                                    log('Blocked dynamic NS anchor.click():', href);
-                                    return;
-                                }
-                                return nativeClick.apply(this, arguments);
-                            };
-                        }
-                        return el;
-                    },
-                });
-            }
-
-            log('DynamicAnchorGuard installed');
-        };
-        return { install };
-    })();
-
-    /* ═══════════════════════════════════════════════════════════════
-       SYNTHETIC BLANK-CLICK SHIELD (Diperkuat)
+       ANCHOR CLICK SHIELD (FIXED - with allowlist approach)
        ═══════════════════════════════════════════════════════════════ */
     const AnchorClickShield = (() => {
         const isBlankAdAnchor = el =>
@@ -642,16 +515,11 @@
             (el.getAttribute('target') === '_blank' ||
              el.getAttribute('target') === '_new') &&
             isBlockedURL(el.href);
-        const isBlankAdArea = el =>
-            el instanceof HTMLAreaElement &&
-            (el.getAttribute('target') === '_blank' ||
-             el.getAttribute('target') === '_new') &&
-            isBlockedURL(el.href);
 
         const install = () => {
             if (!CONFIG.BLOCK_SYNTHETIC_BLANK_CLICKS) return;
 
-            // HTMLAnchorElement.prototype.click
+            // Patch HTMLAnchorElement.prototype.click
             try {
                 const proto = HTMLAnchorElement.prototype;
                 const nativeClick = proto.click;
@@ -665,27 +533,27 @@
                 };
             } catch (e) { warn('anchor.click patch failed:', e); }
 
-            // HTMLElement.prototype.click (untuk area)
+            // Patch HTMLElement.prototype.click for broader coverage
             try {
                 const proto = HTMLElement.prototype;
                 const nativeClick = proto.click;
                 proto.click = function () {
-                    if (isBlankAdArea(this) || isBlankAdAnchor(this)) {
+                    if (this instanceof HTMLAnchorElement && isBlankAdAnchor(this)) {
                         stats.syntheticClicks++;
-                        log('Blocked synthetic element.click():', this.href || this);
+                        log('Blocked synthetic element.click():', this.href);
                         return;
                     }
                     return nativeClick.apply(this, arguments);
                 };
             } catch (e) { warn('element.click patch failed:', e); }
 
-            // Element.prototype.dispatchEvent
+            // Patch dispatchEvent
             try {
                 const proto = Element.prototype;
                 const nativeDispatch = proto.dispatchEvent;
                 proto.dispatchEvent = function (event) {
                     if (event && event.type === 'click' && !event.isTrusted) {
-                        if (isBlankAdAnchor(this) || isBlankAdArea(this)) {
+                        if (this instanceof HTMLAnchorElement && isBlankAdAnchor(this)) {
                             stats.syntheticClicks++;
                             log('Blocked synthetic dispatchEvent(click):', this.href);
                             return false;
@@ -695,22 +563,6 @@
                 };
             } catch (e) { warn('dispatchEvent patch failed:', e); }
 
-            // HTMLFormElement.prototype.submit
-            try {
-                const proto = HTMLFormElement.prototype;
-                const nativeSubmit = proto.submit;
-                proto.submit = function () {
-                    const tgt = this.getAttribute('target');
-                    if ((tgt === '_blank' || tgt === '_new') &&
-                        isBlockedURL(this.action)) {
-                        stats.syntheticClicks++;
-                        log('Blocked form.submit() to ad:', this.action);
-                        return;
-                    }
-                    return nativeSubmit.apply(this, arguments);
-                };
-            } catch (e) { warn('form.submit patch failed:', e); }
-
             log('AnchorClickShield installed');
         };
 
@@ -718,128 +570,109 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       LOCATION REDIRECT GUARD (Diperkuat)
+       CROSS-ORIGIN BLANK CLICK BLOCKER (NEW - allowlist approach)
        ═══════════════════════════════════════════════════════════════ */
-    const LocationGuard = (() => {
+    const CrossOriginBlocker = (() => {
         const install = () => {
-            if (!CONFIG.BLOCK_AD_LOCATION_REDIRECTS) return;
+            // Block ALL _blank clicks to cross-origin domains
+            // This is the most effective approach for manga sites
+            document.addEventListener('click', e => {
+                const a = e.target?.closest?.('a[href]');
+                if (!a) return;
 
-            const wrap = (proto, name, nativeFn) => {
-                if (typeof nativeFn !== 'function') return;
-                try {
-                    Object.defineProperty(proto, name, {
-                        value: function (url) {
-                            if (isBlockedURL(url)) {
-                                stats.locationBlocked++;
-                                log(`Blocked location.${name} to ad:`, url);
-                                return;
-                            }
-                            return nativeFn.call(this, url);
-                        },
-                        writable: true,
-                        configurable: true,
-                    });
-                } catch (e) { warn(`location.${name} patch failed:`, e); }
-            };
+                const target = (a.getAttribute('target') || '').toLowerCase();
+                if (target !== '_blank' && target !== '_new') return;
 
-            // Location.prototype
-            try {
-                wrap(Location.prototype, 'assign', Location.prototype.assign);
-                wrap(Location.prototype, 'replace', Location.prototype.replace);
-            } catch (e) { warn('Location prototype patch failed:', e); }
+                const url = normalizeURL(a.href);
+                if (!url) return;
 
-            // Location.prototype.href setter
-            try {
-                const desc = Object.getOwnPropertyDescriptor(
-                    Location.prototype, 'href'
-                );
-                if (desc && desc.set) {
-                    const nativeSet = desc.set;
-                    Object.defineProperty(Location.prototype, 'href', {
-                        ...desc,
-                        set: function (url) {
-                            if (isBlockedURL(url)) {
-                                stats.locationBlocked++;
-                                log('Blocked location.href= to ad:', url);
-                                return;
-                            }
-                            return nativeSet.call(this, url);
-                        },
-                        configurable: true,
-                    });
-                }
-            } catch (e) { warn('location.href setter patch failed:', e); }
+                // Allow same-origin
+                if (url.hostname === location.hostname) return;
+                if (url.hostname === 'www.' + location.hostname) return;
+                if ('www.' + url.hostname === location.hostname) return;
 
-            // BARU: Patch window.location (instance properties)
-            try {
-                const locDesc = Object.getOwnPropertyDescriptor(window, 'location');
-                if (locDesc && locDesc.set) {
-                    const nativeSet = locDesc.set;
-                    Object.defineProperty(window, 'location', {
-                        ...locDesc,
-                        set: function(url) {
-                            if (isBlockedURL(url)) {
-                                stats.locationBlocked++;
-                                log('Blocked window.location= to ad:', url);
-                                return;
-                            }
-                            return nativeSet.call(this, url);
-                        },
-                        configurable: true,
-                    });
-                }
-            } catch (e) { warn('window.location patch failed:', e); }
+                // Block everything else
+                e.preventDefault();
+                e.stopPropagation();
+                stats.blankAnchors++;
+                log('Blocked cross-origin _blank:', url.href);
+            }, true);
 
-            // BARU: Patch document.location
-            try {
-                const docLocDesc = Object.getOwnPropertyDescriptor(document, 'location');
-                if (docLocDesc && docLocDesc.set) {
-                    const nativeSet = docLocDesc.set;
-                    Object.defineProperty(document, 'location', {
-                        ...docLocDesc,
-                        set: function(url) {
-                            if (isBlockedURL(url)) {
-                                stats.locationBlocked++;
-                                log('Blocked document.location= to ad:', url);
-                                return;
-                            }
-                            return nativeSet.call(this, url);
-                        },
-                        configurable: true,
-                    });
-                }
-            } catch (e) { warn('document.location patch failed:', e); }
+            // Also block auxclick (middle click)
+            document.addEventListener('auxclick', e => {
+                if (e.button !== 1) return; // middle click only
+                const a = e.target?.closest?.('a[href]');
+                if (!a) return;
 
-            // BARU: Patch top.location
-            try {
-                if (window.top && window.top !== window) {
-                    const topLocDesc = Object.getOwnPropertyDescriptor(window.top, 'location');
-                    if (topLocDesc && topLocDesc.set) {
-                        const nativeSet = topLocDesc.set;
-                        Object.defineProperty(window.top, 'location', {
-                            ...topLocDesc,
-                            set: function(url) {
-                                if (isBlockedURL(url)) {
-                                    stats.locationBlocked++;
-                                    log('Blocked top.location= to ad:', url);
-                                    return;
-                                }
-                                return nativeSet.call(this, url);
-                            },
-                            configurable: true,
-                        });
-                    }
-                }
-            } catch (e) { warn('top.location patch failed:', e); }
+                const url = normalizeURL(a.href);
+                if (!url) return;
+                if (url.hostname === location.hostname) return;
 
-            log('LocationGuard installed');
+                e.preventDefault();
+                e.stopPropagation();
+                stats.blankAnchors++;
+                log('Blocked middle-click cross-origin:', url.href);
+            }, true);
+
+            log('CrossOriginBlocker installed');
         };
 
         return { install };
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       REQUEST INTERCEPTION (Diperkuat)
+       SCRIPT LOADER BLOCKER (NEW - prevent ad scripts from loading)
+       ═══════════════════════════════════════════════════════════════ */
+    const ScriptLoaderBlocker = (() => {
+        const install = () => {
+            // Intercept appendChild, insertBefore for SCRIPT elements
+            const methods = ['appendChild', 'insertBefore', 'append', 'prepend', 'insertAdjacentElement', 'replaceWith'];
+
+            for (const method of methods) {
+                const proto = Node.prototype;
+                if (!proto[method]) continue;
+
+                const native = proto[method];
+                proto[method] = function(...args) {
+                    for (const arg of args) {
+                        if (arg instanceof HTMLScriptElement) {
+                            const src = arg.getAttribute('src');
+                            if (src) {
+                                const p = normalizeURL(src);
+                                if (p && isBlockedURL(src)) {
+                                    log('Blocked script append:', src);
+                                    arg.removeAttribute('src');
+                                    arg.setAttribute('type', 'javascript/blocked');
+                                    arg.textContent = '';
+                                    stats.requests++;
+                                    return arg; // Return without executing
+                                }
+                                // Block cross-origin scripts not in allowlist
+                                if (p && p.hostname !== location.hostname &&
+                                    !p.hostname.endsWith('.' + location.hostname) &&
+                                    !location.hostname.endsWith('.' + p.hostname)) {
+                                    log('Blocked cross-origin script:', src);
+                                    arg.removeAttribute('src');
+                                    arg.setAttribute('type', 'javascript/blocked');
+                                    arg.textContent = '';
+                                    stats.requests++;
+                                    return arg;
+                                }
+                            }
+                        }
+                    }
+                    return native.apply(this, args);
+                };
+            }
+
+            log('ScriptLoaderBlocker installed');
+        };
+
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       REQUEST INTERCEPTION
        ═══════════════════════════════════════════════════════════════ */
     const RequestBlocker = (() => {
         const installFetch = () => {
@@ -903,7 +736,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       HIJACK OVERLAY CLEANER (Diperkuat)
+       HIJACK OVERLAY CLEANER (FIXED - broader detection)
        ═══════════════════════════════════════════════════════════════ */
     const HijackOverlayCleaner = (() => {
         const removed = new WeakSet();
@@ -924,17 +757,39 @@
             if (!(el instanceof Element)) return false;
             let style;
             try { style = getComputedStyle(el); } catch { return false; }
-            if (style.position !== 'fixed') return false;
-            const op = parseOpacity(style);
-            const z  = parseZIndex(style);
-            if (op > CONFIG.HIJACK_OPACITY_MAX) return false;
+
+            const pos = style.position;
+            if (pos !== 'fixed' && pos !== 'absolute' && pos !== 'sticky') return false;
+
+            const z = parseZIndex(style);
             if (z < CONFIG.HIJACK_ZINDEX_MIN) return false;
+
             const rect = el.getBoundingClientRect();
-            if (rect.width < 2 || rect.height < 2) return false;
+            if (rect.width < 10 || rect.height < 10) return false;
             if (rect.right < 0 || rect.bottom < 0) return false;
             if (rect.left > window.innerWidth) return false;
             if (rect.top > window.innerHeight) return false;
-            return true;
+
+            // Check if element covers significant viewport area
+            const vp = Math.max(1, window.innerWidth * window.innerHeight);
+            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+            const coversViewport = area / vp >= 0.15;
+
+            // Check if element has no visible content (transparent hijack)
+            const hasVisibleContent = el.querySelector('img, video, canvas, svg, iframe') !== null ||
+                                      (el.innerText || '').trim().length > 0;
+
+            // Either very transparent OR covers viewport with no visible content
+            const op = parseOpacity(style);
+            const isTransparent = op <= CONFIG.HIJACK_OPACITY_MAX;
+            const bg = style.backgroundColor;
+            const isTransparentBg = bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)';
+
+            if (isTransparent && z >= 100) return true;
+            if (coversViewport && !hasVisibleContent && z >= 50) return true;
+            if (isTransparentBg && coversViewport && z >= 50) return true;
+
+            return false;
         };
 
         const hasInlineLocationRedirect = el => {
@@ -987,9 +842,7 @@
             let cands;
             try {
                 cands = document.querySelectorAll(
-                    'div[style*="position:fixed"],div[style*="position: fixed"],' +
-                    'div[style*="position:fixed !important"],' +
-                    '[onclick],[ontouchend],[onmousedown],[ontouchstart],[onmouseup],[onpointerdown],[onpointerup]'
+                    'div,section,article,aside,nav,header,footer,span'
                 );
             } catch { return; }
             for (const c of cands) {
@@ -1003,7 +856,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       DOM CLEANER (Diperkuat)
+       DOM CLEANER (FIXED - with image allowlist)
        ═══════════════════════════════════════════════════════════════ */
     const DOMCleaner = (() => {
         const removed = new WeakSet();
@@ -1012,7 +865,9 @@
             switch (el.tagName) {
                 case 'SCRIPT': case 'IFRAME': case 'IMG':
                 case 'SOURCE': case 'VIDEO': case 'EMBED':
-                    return el.getAttribute('src') || el.getAttribute('data-src');
+                    return el.getAttribute('src') || el.getAttribute('data-src') ||
+                           el.getAttribute('data-original') || el.getAttribute('data-echo') ||
+                           el.getAttribute('data-lazy');
                 case 'LINK':  return el.getAttribute('href');
                 case 'OBJECT':return el.getAttribute('data');
                 case 'A': case 'AREA':
@@ -1037,19 +892,24 @@
                 const urls = [
                     el.getAttribute('src'),
                     el.getAttribute('data-src'),
+                    el.getAttribute('data-original'),
+                    el.getAttribute('data-echo'),
+                    el.getAttribute('data-lazy'),
                     ...getSourcesetURLs(el),
                 ].filter(Boolean);
                 for (const u of urls) {
                     if (isBlockedURL(u)) return true;
                     if (looksLikeAdGifURL(u)) return true;
+                    if (isImageHostBlocked(u)) return true;
                 }
                 if (el.tagName === 'PICTURE') {
-                    const subs = el.querySelectorAll('source[srcset],source[src],img[src]');
+                    const subs = el.querySelectorAll('source[srcset],source[src],img[src],img[data-src]');
                     for (const s of subs) {
                         const su = s.getAttribute('src') ||
                                    s.getAttribute('data-src') ||
+                                   s.getAttribute('data-original') ||
                                    (s.getAttribute('srcset')||'').split(',')[0]?.trim().split(/\s+/)[0];
-                        if (su && (isBlockedURL(su) || looksLikeAdGifURL(su))) return true;
+                        if (su && (isBlockedURL(su) || looksLikeAdGifURL(su) || isImageHostBlocked(su))) return true;
                     }
                 }
             }
@@ -1100,6 +960,12 @@
 
         const processElement = el => {
             if (!(el instanceof Element)) return;
+
+            // Sandbox new iframes
+            if (CONFIG.SANDBOX_NEW_IFRAMES && el.tagName === 'IFRAME') {
+                IframeSandboxer.sandbox(el);
+            }
+
             if (isKnownAdElement(el)) {
                 classify(el);
                 remove(el, 'known ad element');
@@ -1108,7 +974,7 @@
             let descendants;
             try {
                 descendants = el.querySelectorAll(
-                    `${AD_SELECTOR},${RESOURCE_SELECTOR},img[src],img[data-src],` +
+                    `${AD_SELECTOR},${RESOURCE_SELECTOR},img[src],img[data-src],img[data-original],img[data-echo],img[data-lazy],` +
                     `iframe[src],iframe[data-src],picture,source[srcset],source[src]`
                 );
             } catch { return; }
@@ -1125,7 +991,7 @@
             let cands;
             try {
                 cands = document.querySelectorAll(
-                    `${AD_SELECTOR},${RESOURCE_SELECTOR},img[src],img[data-src],` +
+                    `${AD_SELECTOR},${RESOURCE_SELECTOR},img[src],img[data-src],img[data-original],img[data-echo],img[data-lazy],` +
                     `iframe[src],iframe[data-src],picture,source[srcset],source[src]`
                 );
             } catch (err) { warn('cleanup failed:', err); return; }
@@ -1222,7 +1088,7 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
-       CSS HIDING (Diperluas)
+       CSS HIDING (Cleaned - removed dangerous broad selectors)
        ═══════════════════════════════════════════════════════════════ */
     const installCosmeticFilter = () => {
         if (!CONFIG.REMOVE_AD_ELEMENTS) return;
@@ -1242,19 +1108,13 @@
             a[target="_blank"][href*="aipornhub.ltd"],
             a[target="_blank"][href*="oe188bu.com"],
             a[target="_blank"][href*="lp-is.com"],
-            a[target="_blank"][href*="go2cloud.org"],
-            a[target="_blank"][href*="onclickmega.com"],
             img.ad-img,
             picture > source[srcset*=".gif"],
             img[src*="/gg"][src$=".gif"],
             img[src*="guanggao"][src$=".gif"],
             img[src*="tuiguang"][src$=".gif"],
             img[src*="banner"][src$=".gif"],
-            img[src*="cdnweb.win"][src$=".gif"],
-            /* BARU: sembunyikan elemen popup umum */
-            [class*="popup" i][style*="fixed"],
-            [id*="popup" i][style*="fixed"],
-            [class*="modal" i][style*="fixed"] {
+            img[src*="cdnweb.win"][src$=".gif"] {
                 display: none !important;
                 visibility: hidden !important;
                 pointer-events: none !important;
@@ -1275,7 +1135,7 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
-       MUTATION OBSERVER (Dipercepat)
+       MUTATION OBSERVER
        ═══════════════════════════════════════════════════════════════ */
     const MutationEngine = (() => {
         let observer = null;
@@ -1335,14 +1195,12 @@
     };
 
     try {
-        // document-start shields — URUTAN PENTING!
-        CodeInjectionGuard.install();    // BARU: blok eval/Function/setTimeout string
-        BeforeUnloadGuard.install();     // BARU: blok beforeunload redirect
-        DynamicAnchorGuard.install();    // BARU: intercept createElement('a')
-        ClickGuard.install();
-        PopupBlocker.install();
-        AnchorClickShield.install();
-        LocationGuard.install();
+        // ── Order matters! Install realm patcher FIRST ──
+        RealmPatcher.install();          // NEW: Patch iframe realms
+        ScriptLoaderBlocker.install();   // NEW: Block ad scripts before they load
+        CrossOriginBlocker.install();    // NEW: Block all cross-origin _blank
+        PopupBlocker.install();          // FIXED: No recursive getter
+        AnchorClickShield.install();     // FIXED: Clean implementation
         RequestBlocker.install();
         installCosmeticFilter();
 
@@ -1361,7 +1219,7 @@
             configurable: true,
         });
 
-        log('Initialized successfully (v8.1.0)');
+        log('Initialized successfully (v9.0.0)');
     } catch (err) {
         console.error(PREFIX, 'Initialization failed:', err);
     }
