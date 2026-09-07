@@ -320,19 +320,20 @@
     };
 
     // ── NEW: Check if image host is NOT in allowlist ──
+    // Does NOT mutate IMAGE_ALLOWLIST — creates a temporary set each call.
     const isImageHostBlocked = url => {
         if (!CONFIG.USE_IMAGE_ALLOWLIST) return false;
         const p = normalizeURL(url);
         if (!p) return false;
-        // Auto-populate allowlist with current page hostname
-        IMAGE_ALLOWLIST.add(location.hostname);
-        // Also add www variant
+        // Build a temporary allowlist including current page hostname
+        const allowed = new Set(IMAGE_ALLOWLIST);
+        allowed.add(location.hostname);
         if (location.hostname.startsWith('www.')) {
-            IMAGE_ALLOWLIST.add(location.hostname.slice(4));
+            allowed.add(location.hostname.slice(4));
         } else {
-            IMAGE_ALLOWLIST.add('www.' + location.hostname);
+            allowed.add('www.' + location.hostname);
         }
-        return !Array.from(IMAGE_ALLOWLIST).some(h => hostnameMatches(p.hostname, h));
+        return !Array.from(allowed).some(h => hostnameMatches(p.hostname, h));
     };
 
     /* ═══════════════════════════════════════════════════════════════
