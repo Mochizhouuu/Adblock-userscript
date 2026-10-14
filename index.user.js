@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Popup & Ad Blocker Pro — China-Enhanced v9
 // @namespace    http://tampermonkey.net/
-// @version      9.0.0
-// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (FIXED: recursive getter, realm iframe, allowlist approach)
+// @version      9.1.0
+// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (heuristic banners, animated-image context, document.write guard)
 // @author       Mochizhouuu
 // @match        *://*/*
 // @grant        none
@@ -41,13 +41,15 @@
         BLOCK_AD_IFRAMES: true,
         BLOCK_AD_LOCATION_REDIRECTS: true,
         REMOVE_HIJACK_OVERLAYS: true,
+        BLOCK_FIRST_PARTY_AD_PATHS: true,
+        BLOCK_AD_SOCKETS: true,
+        BLOCK_DOCUMENT_WRITE_ADS: true,
+        WATCH_ATTRIBUTE_CHANGES: true,
+        REMOVE_FIXED_AD_BANNERS: true,
 
         // ── NEW: iframe realm patching ──
         PATCH_IFRAME_REALM: true,
         SANDBOX_NEW_IFRAMES: true,
-
-        // ── NEW: allowlist approach for images ──
-        USE_IMAGE_ALLOWLIST: true,
 
         // ── REMOVED: dangerous eval/Function patching ──
         // BLOCK_EVAL_INJECTION: false,
@@ -55,7 +57,7 @@
         // BLOCK_DYNAMIC_ANCHOR_CLICK: false,
 
         // ── Popup tolerance ──
-        MAX_POPUPS_PER_INTERACTION: 0,  // 0 = block ALL
+        MAX_POPUPS_PER_INTERACTION: 0,  // reserved; user-activated popups are allowed
         USER_ACTIVATION_WINDOW_MS: 1500,
         CLEANUP_INTERVAL_MS: 2000,
 
@@ -132,17 +134,6 @@
         'talkingdata.com','getui.com','shuzilm.cn',
         'cdnweb.win','umami.is','cloudflareinsights.com',
         'googletagmanager.com','instant.page',
-    ]);
-
-    // ── NEW: Image allowlist for wmanhua.com ──
-    // These are the legitimate image hosts for the comic site
-    // Add more as needed based on Network tab inspection
-    const IMAGE_ALLOWLIST = new Set([
-        // wmanhua.com itself
-        'www.wmanhua.com',
-        'wmanhua.com',
-        // Common CDN hosts for manga sites (add based on actual site)
-        // Leave empty to auto-detect from page resources
     ]);
 
     /* ═══════════════════════════════════════════════════════════════
@@ -274,7 +265,8 @@
         popups: 0, requests: 0, elements: 0, overlays: 0,
         metaRedirects: 0, hijacks: 0, syntheticClicks: 0, blankAnchors: 0,
         gifs: 0, iframes: 0, locationBlocked: 0, hijackOverlays: 0,
-        realmPatches: 0, sandboxedIframes: 0,
+        realmPatches: 0, sandboxedIframes: 0, docwrite: 0, sockets: 0,
+        banners: 0,
     };
 
     /* ═══════════════════════════════════════════════════════════════
@@ -303,6 +295,23 @@
         (CONFIG.BLOCK_AD_REQUESTS && matchesDomainSet(url, AD_DOMAINS)) ||
         (CONFIG.BLOCK_TRACKERS && matchesDomainSet(url, TRACKER_DOMAINS));
 
+    const AD_PATH_PATTERN =
+        /(?:^|[\/_.?&#-])(?:ads?|adv?|adverts?|advertisements?|sponsors?(?:ed)?|promos?(?:tion)?|banners?|pop(?:ups?|unders?)?|interstitials?)(?:[\/_.?&#-]|$)/i;
+    const AD_QUERY_PATTERN = /(^|[?&])(?:ad|ads|advert|sponsor|promo|banner)=/i;
+    const sameSite = (a, b) => {
+        a = (a || '').toLowerCase(); b = (b || '').toLowerCase();
+        return !!a && !!b && (a === b || a.endsWith('.' + b) || b.endsWith('.' + a));
+    };
+    const isFirstPartyAdURL = url => {
+        if (!CONFIG.BLOCK_FIRST_PARTY_AD_PATHS) return false;
+        const u = normalizeURL(url);
+        if (!u || !/^https?:$/.test(u.protocol)) return false;
+        if (!sameSite(u.hostname, location.hostname)) return false;
+        const hay = `${u.pathname}?${u.search}`;
+        return AD_PATH_PATTERN.test(hay) || AD_QUERY_PATTERN.test(u.search);
+    };
+    const isAdResourceURL = url => isBlockedURL(url) || isFirstPartyAdURL(url);
+
     const looksLikeAdGifURL = url => {
         const p = normalizeURL(url);
         if (!p) return false;
@@ -317,23 +326,6 @@
         if (!ua || !ub) return false;
         return ua.hostname === ub.hostname &&
                ua.pathname === ub.pathname && ua.search === ub.search;
-    };
-
-    // ── NEW: Check if image host is NOT in allowlist ──
-    // Does NOT mutate IMAGE_ALLOWLIST — creates a temporary set each call.
-    const isImageHostBlocked = url => {
-        if (!CONFIG.USE_IMAGE_ALLOWLIST) return false;
-        const p = normalizeURL(url);
-        if (!p) return false;
-        // Build a temporary allowlist including current page hostname
-        const allowed = new Set(IMAGE_ALLOWLIST);
-        allowed.add(location.hostname);
-        if (location.hostname.startsWith('www.')) {
-            allowed.add(location.hostname.slice(4));
-        } else {
-            allowed.add('www.' + location.hostname);
-        }
-        return !Array.from(allowed).some(h => hostnameMatches(p.hostname, h));
     };
 
     /* ═══════════════════════════════════════════════════════════════
@@ -358,8 +350,7 @@
                             log('Blocked realm popup:', url);
                             return null;
                         }
-                        // Block all cross-origin popups without consent
-                        return null; // Zero tolerance
+                        return native.apply(this, args);
                     };
                 }
 
@@ -396,8 +387,9 @@
 
                 Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
                     get() {
-                        const w = d.get.call(this);
-                        patchRealm(w);
+                        let w;
+                        try { w = d.get.call(this); } catch (e) { return null; }
+                        try { patchRealm(w); } catch (e) { warn('patchRealm failed:', e); }
                         return w;
                     },
                     configurable: true,
@@ -408,8 +400,9 @@
                 if (dd && dd.get) {
                     Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', {
                         get() {
-                            const doc = dd.get.call(this);
-                            if (doc && doc.defaultView) patchRealm(doc.defaultView);
+                            let doc;
+                            try { doc = dd.get.call(this); } catch (e) { return null; }
+                            try { if (doc && doc.defaultView) patchRealm(doc.defaultView); } catch (e) { warn('patchRealm failed:', e); }
                             return doc;
                         },
                         configurable: true,
@@ -477,11 +470,7 @@
                     return null;
                 }
 
-                if (CONFIG.MAX_POPUPS_PER_INTERACTION === 0) {
-                    stats.popups++;
-                    log('Blocked all popups (zero tolerance):', requestedURL);
-                    return null;
-                }
+                // Allow legitimate user-initiated popups (zero-tolerance gate removed)
 
                 return Reflect.apply(target, thisArg, args);
             },
@@ -508,7 +497,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       ANCHOR CLICK SHIELD (FIXED - with allowlist approach)
+       ANCHOR CLICK SHIELD
        ═══════════════════════════════════════════════════════════════ */
     const AnchorClickShield = (() => {
         const isBlankAdAnchor = el =>
@@ -571,7 +560,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       CROSS-ORIGIN BLANK CLICK BLOCKER (NEW - allowlist approach)
+       CROSS-ORIGIN BLANK CLICK BLOCKER
        ═══════════════════════════════════════════════════════════════ */
     const CrossOriginBlocker = (() => {
         const install = () => {
@@ -592,11 +581,13 @@
                 if (url.hostname === 'www.' + location.hostname) return;
                 if ('www.' + url.hostname === location.hostname) return;
 
-                // Block everything else
+                // Only block known ad/tracker domains
+                if (!isBlockedURL(url)) return;
+
                 e.preventDefault();
                 e.stopPropagation();
                 stats.blankAnchors++;
-                log('Blocked cross-origin _blank:', url.href);
+                log('Blocked ad _blank:', url.href);
             }, true);
 
             // Also block auxclick (middle click)
@@ -608,11 +599,12 @@
                 const url = normalizeURL(a.href);
                 if (!url) return;
                 if (url.hostname === location.hostname) return;
+                if (!isBlockedURL(url)) return;
 
                 e.preventDefault();
                 e.stopPropagation();
                 stats.blankAnchors++;
-                log('Blocked middle-click cross-origin:', url.href);
+                log('Blocked middle-click ad:', url.href);
             }, true);
 
             log('CrossOriginBlocker installed');
@@ -640,7 +632,7 @@
                             const src = arg.getAttribute('src');
                             if (src) {
                                 const p = normalizeURL(src);
-                                if (p && isBlockedURL(src)) {
+                                if (p && isAdResourceURL(src)) {
                                     log('Blocked script append:', src);
                                     arg.removeAttribute('src');
                                     arg.setAttribute('type', 'javascript/blocked');
@@ -648,17 +640,7 @@
                                     stats.requests++;
                                     return arg; // Return without executing
                                 }
-                                // Block cross-origin scripts not in allowlist
-                                if (p && p.hostname !== location.hostname &&
-                                    !p.hostname.endsWith('.' + location.hostname) &&
-                                    !location.hostname.endsWith('.' + p.hostname)) {
-                                    log('Blocked cross-origin script:', src);
-                                    arg.removeAttribute('src');
-                                    arg.setAttribute('type', 'javascript/blocked');
-                                    arg.textContent = '';
-                                    stats.requests++;
-                                    return arg;
-                                }
+                                // Do not block all cross-origin scripts: only block known ad/tracker domains (above)
                             }
                         }
                     }
@@ -681,7 +663,7 @@
             const nativeFetch = window.fetch;
             window.fetch = new Proxy(nativeFetch, {
                 apply(target, thisArg, args) {
-                    if (isBlockedURL(args[0])) {
+                    if (isAdResourceURL(args[0])) {
                         stats.requests++;
                         log('Blocked fetch:', normalizeURL(args[0])?.href);
                         return Promise.resolve(
@@ -697,7 +679,7 @@
             const nativeBeacon = navigator.sendBeacon;
             navigator.sendBeacon = new Proxy(nativeBeacon, {
                 apply(target, thisArg, args) {
-                    if (isBlockedURL(args[0])) {
+                    if (isAdResourceURL(args[0])) {
                         stats.requests++;
                         log('Blocked beacon:', args[0]);
                         return true;
@@ -710,7 +692,7 @@
             if (typeof XMLHttpRequest !== 'function') return;
             const nativeOpen = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-                if (isBlockedURL(url)) {
+                if (isAdResourceURL(url)) {
                     stats.requests++;
                     log('Blocked XHR:', url);
                     this.__aabBlocked = true;
@@ -857,7 +839,7 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
-       DOM CLEANER (FIXED - with image allowlist)
+       DOM CLEANER
        ═══════════════════════════════════════════════════════════════ */
     const DOMCleaner = (() => {
         const removed = new WeakSet();
@@ -886,6 +868,59 @@
                 .filter(Boolean);
         };
 
+        const AD_NAME_PATTERN =
+            /(ad|ads|advert|sponsor|promo|banner|popup|popunder|interstitial|syndication|taboola|outbrain|revcontent|mgid)/i;
+        const elementHasAdName = el => {
+            try {
+                const name = `${el.id || ''} ${typeof el.className === 'string' ? el.className : ''}`;
+                return AD_NAME_PATTERN.test(name);
+            } catch { return false; }
+        };
+        const currentImageURL = el => {
+            try {
+                if (el.tagName === 'SOURCE') {
+                    return el.getAttribute('src') ||
+                           (el.getAttribute('srcset') || '').split(',')[0]?.trim().split(/\s+/)[0] ||
+                           null;
+                }
+                return el.currentSrc ||
+                       el.getAttribute('src') ||
+                       el.getAttribute('data-src') ||
+                       el.getAttribute('data-original') ||
+                       el.getAttribute('data-echo') ||
+                       el.getAttribute('data-lazy') ||
+                       getSourcesetURLs(el)[0] ||
+                       null;
+            } catch { return null; }
+        };
+        const renderedSizeKey = el => {
+            try {
+                let w = el.naturalWidth || 0;
+                let h = el.naturalHeight || 0;
+                if ((!w || !h) && el.getBoundingClientRect) {
+                    const r = el.getBoundingClientRect();
+                    w = Math.round(r.width);
+                    h = Math.round(r.height);
+                }
+                return w > 0 && h > 0 ? `${w}x${h}` : null;
+            } catch { return null; }
+        };
+        const hasAdContext = el => {
+            if (elementHasAdName(el)) return true;
+            try {
+                const link = el.closest?.('a[href],area[href]');
+                if (link) {
+                    const href = link.getAttribute('href') || link.href;
+                    if (href && isAdResourceURL(href)) return true;
+                }
+            } catch {}
+            return false;
+        };
+        const isAdImageLink = el =>
+            el instanceof HTMLAnchorElement &&
+            !!el.querySelector?.('img,picture') &&
+            isAdResourceURL(el.getAttribute('href') || el.href);
+
         const isAdGif = el => {
             if (!CONFIG.BLOCK_AD_GIFS) return false;
             if (el.tagName === 'IMG' || el.tagName === 'SOURCE' ||
@@ -899,9 +934,16 @@
                     ...getSourcesetURLs(el),
                 ].filter(Boolean);
                 for (const u of urls) {
-                    if (isBlockedURL(u)) return true;
+                    if (isAdResourceURL(u)) return true;
                     if (looksLikeAdGifURL(u)) return true;
-                    if (isImageHostBlocked(u)) return true;
+                }
+                if (el.tagName === 'IMG') {
+                    const current = currentImageURL(el);
+                    if (current && /\.gif([?#]|$)/i.test(current)) {
+                        if (isAdResourceURL(current) || looksLikeAdGifURL(current)) return true;
+                        const key = renderedSizeKey(el);
+                        if (key && COMMON_AD_DIMENSIONS.has(key) && hasAdContext(el)) return true;
+                    }
                 }
                 if (el.tagName === 'PICTURE') {
                     const subs = el.querySelectorAll('source[srcset],source[src],img[src],img[data-src]');
@@ -910,7 +952,7 @@
                                    s.getAttribute('data-src') ||
                                    s.getAttribute('data-original') ||
                                    (s.getAttribute('srcset')||'').split(',')[0]?.trim().split(/\s+/)[0];
-                        if (su && (isBlockedURL(su) || looksLikeAdGifURL(su) || isImageHostBlocked(su))) return true;
+                        if (su && (isAdResourceURL(su) || looksLikeAdGifURL(su))) return true;
                     }
                 }
             }
@@ -926,7 +968,7 @@
         const isAdIframe = el =>
             CONFIG.BLOCK_AD_IFRAMES &&
             el.tagName === 'IFRAME' &&
-            isBlockedURL(el.getAttribute('src') || el.getAttribute('data-src'));
+            isAdResourceURL(el.getAttribute('src') || el.getAttribute('data-src'));
 
         const isKnownAdElement = el => {
             if (!(el instanceof Element)) return false;
@@ -934,8 +976,14 @@
             if (isBlankAdAnchor(el)) return true;
             if (isAdIframe(el)) return true;
             if (isAdGif(el)) return true;
+            if (isAdImageLink(el)) return true;
+            if (el.tagName === 'A' || el.tagName === 'AREA') {
+                const u = getResourceURL(el);
+                if (u && isBlockedURL(u)) return true;
+                return false;
+            }
             const u = getResourceURL(el);
-            if (u && isBlockedURL(u)) return true;
+            if (u && isAdResourceURL(u)) return true;
             if (el.tagName === 'PICTURE') {
                 const parentA = el.closest('a[target="_blank"]');
                 if (parentA && isBlockedURL(parentA.href)) return true;
@@ -1115,7 +1163,19 @@
             img[src*="guanggao"][src$=".gif"],
             img[src*="tuiguang"][src$=".gif"],
             img[src*="banner"][src$=".gif"],
-            img[src*="cdnweb.win"][src$=".gif"] {
+            img[src*="cdnweb.win"][src$=".gif"],
+            a[href*="doubleclick.net"] > img,
+            a[href*="googlesyndication.com"] > img,
+            a[href*="pos.baidu.com"] > img,
+            a[href*="gdt.qq.com"] > img,
+            a[href*="tanx.com"] > img,
+            a[href*="alimama.com"] > img,
+            a[href*="gewt00g.com"] > img,
+            a[href*="cdnweb.win"] > img,
+            img[src$=".gif"][src*="300x250"],
+            img[src$=".gif"][src*="728x90"],
+            img[src$=".gif"][src*="960x90"],
+            img[src$=".gif"][src*="160x600"] {
                 display: none !important;
                 visibility: hidden !important;
                 pointer-events: none !important;
@@ -1136,12 +1196,175 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
+       DOCUMENT.WRITE AD GUARD
+       ═══════════════════════════════════════════════════════════════ */
+    const DocumentWriteGuard = (() => {
+        const payloadHasAd = html => {
+            const text = String(html ?? '');
+            if (!text) return false;
+            const urls = text.match(/https?:\/\/[^\s"'<>()]+/gi) || [];
+            if (urls.some(u => isAdResourceURL(u))) return true;
+            return AD_PATH_PATTERN.test(text) ||
+                   /(adsbygoogle|data-ad-client|googlesyndication|doubleclick|taboola|outbrain)/i.test(text);
+        };
+        const install = () => {
+            if (!CONFIG.BLOCK_DOCUMENT_WRITE_ADS) return;
+            for (const name of ['write', 'writeln']) {
+                const native = document[name];
+                if (typeof native !== 'function') continue;
+                document[name] = function (...args) {
+                    try {
+                        // After load, document.write would wipe the page; never allow it.
+                        if (document.readyState !== 'loading') {
+                            stats.docwrite++;
+                            log(`Blocked document.${name} after load`);
+                            return;
+                        }
+                        if (args.some(payloadHasAd)) {
+                            stats.docwrite++;
+                            log(`Blocked document.${name} ad payload`);
+                            return;
+                        }
+                    } catch (e) { warn(`document.${name} guard failed:`, e); }
+                    return native.apply(this, args);
+                };
+            }
+            log('DocumentWriteGuard installed');
+        };
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       AD SOCKET BLOCKER
+       ═══════════════════════════════════════════════════════════════ */
+    const SocketBlocker = (() => {
+        const dummySocket = (url, kind) => ({
+            url: String(url),
+            readyState: kind === 'websocket' ? 3 : 2,
+            bufferedAmount: 0,
+            extensions: '',
+            protocol: '',
+            binaryType: 'blob',
+            onopen: null, onmessage: null, onerror: null, onclose: null,
+            close() {}, send() {},
+            addEventListener() {}, removeEventListener() {},
+            dispatchEvent() { return false; },
+        });
+        const install = () => {
+            if (!CONFIG.BLOCK_AD_SOCKETS) return;
+            try {
+                if (typeof window.EventSource === 'function') {
+                    const NativeEventSource = window.EventSource;
+                    window.EventSource = new Proxy(NativeEventSource, {
+                        construct(target, args) {
+                            if (isAdResourceURL(args[0])) {
+                                stats.sockets++;
+                                log('Blocked EventSource:', args[0]);
+                                return dummySocket(args[0], 'eventsource');
+                            }
+                            return Reflect.construct(target, args);
+                        },
+                    });
+                }
+            } catch (e) { warn('EventSource patch failed:', e); }
+            try {
+                if (typeof window.WebSocket === 'function') {
+                    const NativeWebSocket = window.WebSocket;
+                    window.WebSocket = new Proxy(NativeWebSocket, {
+                        construct(target, args) {
+                            if (isAdResourceURL(args[0])) {
+                                stats.sockets++;
+                                log('Blocked WebSocket:', args[0]);
+                                return dummySocket(args[0], 'websocket');
+                            }
+                            return Reflect.construct(target, args);
+                        },
+                    });
+                }
+            } catch (e) { warn('WebSocket patch failed:', e); }
+            log('SocketBlocker installed');
+        };
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       FIXED/STICKY BANNER CLEANER
+       ═══════════════════════════════════════════════════════════════ */
+    const FixedBannerCleaner = (() => {
+        const removed = new WeakSet();
+        const BANNER_NAME_PATTERN =
+            /(ad|ads|advert|sponsor|promo|banner|popup|popunder|interstitial|syndication|taboola|outbrain|revcontent|mgid)/i;
+
+        const hasBannerName = el => {
+            try {
+                const name = `${el.id || ''} ${typeof el.className === 'string' ? el.className : ''}`;
+                return BANNER_NAME_PATTERN.test(name);
+            } catch { return false; }
+        };
+        const hasAdResource = el => {
+            try {
+                const nodes = el.querySelectorAll(
+                    'img[src],img[data-src],img[data-original],iframe[src],iframe[data-src],a[href],script[src]'
+                );
+                for (const n of nodes) {
+                    const url = n.currentSrc ||
+                                n.getAttribute('src') ||
+                                n.getAttribute('data-src') ||
+                                n.getAttribute('data-original') ||
+                                n.getAttribute('href');
+                    if (url && isAdResourceURL(url)) return true;
+                }
+            } catch {}
+            return false;
+        };
+        const isFixedAdBanner = el => {
+            if (!CONFIG.REMOVE_FIXED_AD_BANNERS) return false;
+            if (!(el instanceof Element) || !el.isConnected) return false;
+            if (!/^(DIV|SECTION|ASIDE|HEADER|FOOTER|INS)$/.test(el.tagName)) return false;
+            let style;
+            try { style = getComputedStyle(el); } catch { return false; }
+            if (style.position !== 'fixed' && style.position !== 'sticky') return false;
+            let rect;
+            try { rect = el.getBoundingClientRect(); } catch { return false; }
+            if (!rect || rect.width < 200 || rect.height < 24) return false;
+            if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
+            // Require real ad proof so normal fixed headers/navbars are untouched.
+            return hasBannerName(el) || hasAdResource(el);
+        };
+        const remove = el => {
+            if (removed.has(el) || !el.isConnected) return false;
+            removed.add(el);
+            el.remove();
+            stats.banners++;
+            log('Removed fixed ad banner:', el);
+            return true;
+        };
+        const process = el => {
+            if (isFixedAdBanner(el)) remove(el);
+        };
+        const fullScan = () => {
+            if (!document.documentElement) return;
+            let cands;
+            try {
+                cands = document.querySelectorAll('div,section,aside,header,footer,ins');
+            } catch { return; }
+            for (const c of cands) process(c);
+        };
+        return { process, fullScan };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
        MUTATION OBSERVER
        ═══════════════════════════════════════════════════════════════ */
     const MutationEngine = (() => {
         let observer = null;
         let scheduled = false;
         const pending = new Set();
+        const ATTRIBUTE_FILTER = [
+            'src', 'srcset', 'href', 'action',
+            'data-src', 'data-srcset', 'data-original', 'data-echo', 'data-lazy',
+            'class', 'style',
+        ];
 
         const flush = () => {
             scheduled = false;
@@ -1150,6 +1373,7 @@
             for (const n of nodes) {
                 if (!(n instanceof Element) || !n.isConnected) continue;
                 DOMCleaner.processElement(n);
+                FixedBannerCleaner.process(n);
                 if (CONFIG.REMOVE_HIJACK_OVERLAYS) HijackOverlayCleaner.process(n);
                 OverlayCleaner.cleanup(n);
                 cleanMetaRefresh(n);
@@ -1165,13 +1389,19 @@
             if (!root) { setTimeout(start, 0); return; }
             observer = new MutationObserver(muts => {
                 for (const m of muts) {
-                    for (const n of m.addedNodes) {
-                        if (n.nodeType === Node.ELEMENT_NODE) pending.add(n);
+                    if (m.type === 'childList') {
+                        for (const n of m.addedNodes) {
+                            if (n.nodeType === Node.ELEMENT_NODE) pending.add(n);
+                        }
+                    } else if (m.type === 'attributes' && m.target instanceof Element) {
+                        pending.add(m.target);
                     }
                 }
                 if (pending.size) schedule();
             });
-            observer.observe(root, { childList: true, subtree: true });
+            observer.observe(root, CONFIG.WATCH_ATTRIBUTE_CHANGES
+                ? { childList: true, subtree: true, attributes: true, attributeFilter: ATTRIBUTE_FILTER }
+                : { childList: true, subtree: true });
             log('MutationObserver started');
         };
         const stop = () => { observer?.disconnect(); observer = null; pending.clear(); };
@@ -1184,6 +1414,7 @@
     const runCleanup = () => {
         if (document.hidden) return;
         DOMCleaner.fullCleanup();
+        FixedBannerCleaner.fullScan();
         if (CONFIG.REMOVE_HIJACK_OVERLAYS) HijackOverlayCleaner.fullScan();
         OverlayCleaner.cleanup(document);
         cleanMetaRefresh(document);
@@ -1198,8 +1429,10 @@
     try {
         // ── Order matters! Install realm patcher FIRST ──
         RealmPatcher.install();          // NEW: Patch iframe realms
+        DocumentWriteGuard.install();    // NEW: Filter document.write ad injection
+        SocketBlocker.install();         // NEW: Block EventSource/WebSocket to ad URLs
         ScriptLoaderBlocker.install();   // NEW: Block ad scripts before they load
-        CrossOriginBlocker.install();    // NEW: Block all cross-origin _blank
+        CrossOriginBlocker.install();    // NEW: Block _blank links to ad domains
         PopupBlocker.install();          // FIXED: No recursive getter
         AnchorClickShield.install();     // FIXED: Clean implementation
         RequestBlocker.install();
@@ -1220,7 +1453,7 @@
             configurable: true,
         });
 
-        log('Initialized successfully (v9.0.0)');
+        log('Initialized successfully (v9.1.0)');
     } catch (err) {
         console.error(PREFIX, 'Initialization failed:', err);
     }
