@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Popup & Ad Blocker Pro — China-Enhanced v9
 // @namespace    http://tampermonkey.net/
-// @version      9.1.0
+// @version      9.1.1
 // @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (heuristic banners, animated-image context, document.write guard)
 // @author       Mochizhouuu
 // @match        *://*/*
@@ -69,6 +69,31 @@
     const PREFIX = '[🛡️ AAB]';
     const log  = (...a) => CONFIG.DEBUG && console.log(PREFIX, ...a);
     const warn = (...a) => CONFIG.DEBUG && console.warn(PREFIX, ...a);
+
+    /* ═══════════════════════════════════════════════════════════════
+       PENGECUALIAN UI USERSCRIPT (koordinasi antar userscript)
+
+       Beberapa userscript UI (mis. "API Inspector / Endpoint Finder")
+       memasang panel memakai host div fixed + z-index sangat tinggi,
+       dengan isi di dalam shadow root. Dari sudut pandang heuristik
+       hijack-overlay di bawah ini, host seperti itu memang terlihat
+       seperti overlay pembajak: fixed, z-index >= 50, background
+       transparan di level host, dan menutup cuplikan viewport besar,
+       padahal konten light-DOM-nya kosong. Elemen yang diberi tanda
+       di bawah ini JANGAN dihapus oleh cleaner mana pun.
+       ═══════════════════════════════════════════════════════════════ */
+    const UI_EXEMPT_SELECTOR = [
+        '[data-userscript-ui]',
+        '[data-api-inspector]',
+        '[data-api-inspector-boot-error]',
+        '#api-inspector-userscript-host',
+    ].join(',');
+
+    const isUserscriptUI = el => {
+        try {
+            return !!(el && el.matches && el.matches(UI_EXEMPT_SELECTOR));
+        } catch { return false; }
+    };
 
     /* ═══════════════════════════════════════════════════════════════
        DOMAIN LISTS
@@ -791,7 +816,8 @@
         };
 
         const remove = el => {
-            if (removed.has(el) || !el.isConnected) return false;
+            if (isUserscriptUI(el) || removed.has(el) || !el.isConnected)
+                return false;
             removed.add(el);
             el.remove();
             stats.hijackOverlays++;
@@ -801,6 +827,7 @@
 
         const process = el => {
             if (!(el instanceof Element) || !el.isConnected) return;
+            if (isUserscriptUI(el)) return;
             if (looksLikeHijackOverlay(el)) {
                 remove(el);
                 return;
@@ -829,6 +856,7 @@
                 );
             } catch { return; }
             for (const c of cands) {
+                if (isUserscriptUI(c)) continue;
                 if (looksLikeHijackOverlay(c) || hasInlineLocationRedirect(c)) {
                     remove(c);
                 }
@@ -992,7 +1020,10 @@
         };
 
         const remove = (el, reason) => {
-            if (!(el instanceof Element) || removed.has(el) || !el.isConnected)
+            if (!(el instanceof Element) ||
+                isUserscriptUI(el) ||
+                removed.has(el) ||
+                !el.isConnected)
                 return false;
             removed.add(el);
             log('Removed:', reason, el);
@@ -1009,6 +1040,7 @@
 
         const processElement = el => {
             if (!(el instanceof Element)) return;
+            if (isUserscriptUI(el)) return;
 
             // Sandbox new iframes
             if (CONFIG.SANDBOX_NEW_IFRAMES && el.tagName === 'IFRAME') {
@@ -1332,7 +1364,8 @@
             return hasBannerName(el) || hasAdResource(el);
         };
         const remove = el => {
-            if (removed.has(el) || !el.isConnected) return false;
+            if (isUserscriptUI(el) || removed.has(el) || !el.isConnected)
+                return false;
             removed.add(el);
             el.remove();
             stats.banners++;
@@ -1340,6 +1373,7 @@
             return true;
         };
         const process = el => {
+            if (isUserscriptUI(el)) return;
             if (isFixedAdBanner(el)) remove(el);
         };
         const fullScan = () => {
@@ -1453,7 +1487,7 @@
             configurable: true,
         });
 
-        log('Initialized successfully (v9.1.0)');
+        log('Initialized successfully (v9.1.1)');
     } catch (err) {
         console.error(PREFIX, 'Initialization failed:', err);
     }
