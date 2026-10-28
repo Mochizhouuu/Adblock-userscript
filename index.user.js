@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Popup & Ad Blocker Pro — China-Enhanced v9
 // @namespace    http://tampermonkey.net/
-// @version      9.1.1
-// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, location-redirect guard, GIF-ad detector — tuned for Chinese sites (heuristic banners, animated-image context, document.write guard)
+// @version      9.2.0
+// @description  Popup blocker, ad/tracker blocker, anti-adblock overlay remover, click-hijack grid killer, gesture & navigation guard, history flood guard, synthetic-_blank guard, GIF-ad detector — tuned for Chinese sites (heuristic banners, animated-image context, document.write guard)
 // @author       Mochizhouuu
 // @match        *://*/*
 // @grant        none
@@ -57,9 +57,22 @@
         // BLOCK_DYNAMIC_ANCHOR_CLICK: false,
 
         // ── Popup tolerance ──
-        MAX_POPUPS_PER_INTERACTION: 0,  // reserved; user-activated popups are allowed
         USER_ACTIVATION_WINDOW_MS: 1500,
         CLEANUP_INTERVAL_MS: 2000,
+
+        // ── NEW v9.2: deteksi iklan lewat pola ukuran slot ──
+        BLOCK_ADS_BY_DIMENSION: true,     // banner/iframe berukuran sama dengan slot iklan terkonfirmasi = iklan
+
+        // ── NEW v9.2: Gesture & navigation guard ──
+        STRICT_GESTURE_POPUPS: true,      // window.open lintas origin harus cocok dengan link yang diklik
+        ALLOW_CROSS_ORIGIN_FIRST: false,  // true = izinkan 1 popup lintas origin pertama per gesture
+        MAX_OPENS_PER_GESTURE: 5,         // batas total window.open per gesture
+        RESTORE_HIJACKED_NAV: true,       // pulihkan navigasi link/next yang dibajak
+        RESTORE_DELAY_MS: 150,
+        BLOCK_SYNTHETIC_CROSS_ORIGIN_BLANK: true, // klik sintetis ke anchor _blank lintas origin diblok
+        HISTORY_GUARD: true,              // anti back-trap (flood pushState/replaceState)
+        HISTORY_FLOOD_MAX: 3,
+        HISTORY_WINDOW_MS: 1000,
 
         // ── Overlay detection ──
         HIJACK_OPACITY_MAX: 0.15,
@@ -291,7 +304,7 @@
         metaRedirects: 0, hijacks: 0, syntheticClicks: 0, blankAnchors: 0,
         gifs: 0, iframes: 0, locationBlocked: 0, hijackOverlays: 0,
         realmPatches: 0, sandboxedIframes: 0, docwrite: 0, sockets: 0,
-        banners: 0,
+        banners: 0, opens: 0, historyBlocks: 0, navRestores: 0, dimension: 0,
     };
 
     /* ═══════════════════════════════════════════════════════════════
@@ -354,6 +367,142 @@
     };
 
     /* ═══════════════════════════════════════════════════════════════
+       GESTURE & NAVIGATION GUARD (NEW v9.2)
+       Dua vektor yang selama ini lolos:
+       1. Popunder/popup lintas origin saat gesture — filter lama hanya
+          cek user activation, padahal pembajak klik justru dipicu saat
+          user menekan link/tombol next (activation aktif) sehingga
+          dibiarkan lewat → masuk tab iklan antah berantah.
+       2. Klik sintetis re-dispatch ke anchor _blank lintas origin yang
+          source/domainnya belum ada di blocklist.
+       Solusi: catat anchor yang menerima klik asli, lalu window.open
+       lintas origin hanya diizinkan bila cocok dengan link yang
+       memang diklik (atau host share umum). Navigasi asli yang
+       dibajak (preventDefault + popup iklan) dipulihkan.
+       ═══════════════════════════════════════════════════════════════ */
+    const POPUP_SHARE_HOSTS = new Set([
+        'twitter.com','x.com','facebook.com','api.whatsapp.com','wa.me',
+        't.me','telegram.me','line.me','reddit.com','tumblr.com',
+        'pinterest.com','vk.com','weibo.com','buffer.com',
+    ]);
+
+    const GestureGuard = (() => {
+        const state = {
+            lastInput: 0,          // timestamp input terpercaya terakhir
+            anchorURL: null,       // href anchor yang menerima klik asli
+            pendingAnchor: null,   // info anchor untuk dipulihkan bila dibajak
+            opensInGesture: 0,     // window.open yang sudah lewat dalam gesture ini
+            crossOpens: 0,         // window.open lintas origin yang sudah lewat
+            restoreScheduled: false,
+        };
+
+        const inGesture = () =>
+            Date.now() - state.lastInput <= CONFIG.USER_ACTIVATION_WINDOW_MS;
+
+        const install = () => {
+            // Fase capture: dicatat SEBELUM handler situs sempat mencegat.
+            document.addEventListener('click', e => {
+                if (!e || !e.isTrusted) return;
+                state.lastInput = Date.now();
+                state.opensInGesture = 0;
+                state.crossOpens = 0;
+                const a = e.target?.closest?.('a[href]') || null;
+                state.anchorURL = a ? a.href : null;
+                const tgt = (a?.getAttribute('target') || '').toLowerCase();
+                state.pendingAnchor = a ? {
+                    ts: Date.now(),
+                    href: a.href,
+                    newTab: tgt === '_blank' || tgt === '_new',
+                    defaultPrevented: false,
+                    hijack: false,
+                } : null;
+            }, true);
+
+            // Deteksi preventDefault pada event klik yang sama (fase bubble).
+            document.addEventListener('click', e => {
+                if (!e || !e.isTrusted || !state.pendingAnchor) return;
+                if (e.defaultPrevented) state.pendingAnchor.defaultPrevented = true;
+            }, false);
+            log('GestureGuard installed');
+        };
+
+        /* Tandai calon navigasi yang dibajak (dikirim dari allowOpen). */
+        const noteBlockedOpen = u => {
+            if (!CONFIG.RESTORE_HIJACKED_NAV) return;
+            const pa = state.pendingAnchor;
+            if (!pa || !u) return;
+            if (Date.now() - pa.ts > CONFIG.USER_ACTIVATION_WINDOW_MS) return;
+            if (sameSite(u.hostname, location.hostname)) return;
+            pa.hijack = true;
+            scheduleRestore(pa);
+        };
+
+        const scheduleRestore = pa => {
+            if (state.restoreScheduled) return;
+            state.restoreScheduled = true;
+            setTimeout(() => {
+                state.restoreScheduled = false;
+                const p = state.pendingAnchor;
+                if (!p || p !== pa || !p.hijack) return;
+                if (p.newTab || !p.defaultPrevented) return;
+                if (Date.now() - p.ts > CONFIG.USER_ACTIVATION_WINDOW_MS) return;
+                const dest = normalizeURL(p.href);
+                if (!dest || !/^https?:$/.test(dest.protocol)) return;
+                if (dest.href === location.href) return;
+                stats.navRestores++;
+                log('Restoring hijacked navigation:', p.href);
+                try { location.href = p.href; } catch (e) { warn('restore failed:', e); }
+            }, Math.max(0, CONFIG.RESTORE_DELAY_MS));
+        };
+
+        /* Keputusan sentral window.open (window utama + realm iframe). */
+        const allowOpen = (url, target, activationActive) => {
+            const u = normalizeURL(url);
+            if (!u || !/^https?:$/.test(u.protocol)) return true; // about:blank dll.
+            if (isBlockedURL(u)) return false;                    // domain iklan/tracker
+            if (!activationActive) return false;                  // popup tanpa gesture
+            if (!CONFIG.STRICT_GESTURE_POPUPS || !inGesture()) {
+                // Di luar window gesture: aturan lama + anti-loop longgar.
+                if (Date.now() - state.lastInput > CONFIG.USER_ACTIVATION_WINDOW_MS)
+                    state.opensInGesture = 0;
+                state.opensInGesture++;
+                return state.opensInGesture <= 10;
+            }
+            if (state.opensInGesture >= CONFIG.MAX_OPENS_PER_GESTURE) return false;
+            state.opensInGesture++;
+            if (sameSite(u.hostname, location.hostname)) return true;
+            if (matchesDomainSet(u, POPUP_SHARE_HOSTS)) return true;
+            // Lintas origin di dalam gesture:
+            const anchorMatch = !!state.anchorURL && urlEquals(state.anchorURL, u);
+            if (anchorMatch) return true;                         // popup dari link yang diklik
+            const selfTarget = ['_self','_top','_parent'].includes(
+                String(target || '').toLowerCase());
+            if (selfTarget) { noteBlockedOpen(u); return false; } // penggantian tab saat ini
+            if (CONFIG.ALLOW_CROSS_ORIGIN_FIRST && state.crossOpens === 0) {
+                state.crossOpens++;
+                return true;
+            }
+            noteBlockedOpen(u);                                   // popunder pencuri gesture
+            return false;
+        };
+
+        /* Anchor _blank lintas origin yang "diklik" secara sintetis. */
+        const isSyntheticCrossOriginBlank = a => {
+            if (!CONFIG.BLOCK_SYNTHETIC_CROSS_ORIGIN_BLANK) return false;
+            if (!(a instanceof HTMLAnchorElement)) return false;
+            const tgt = (a.getAttribute('target') || '').toLowerCase();
+            if (tgt !== '_blank' && tgt !== '_new') return false;
+            if (!inGesture()) return false;
+            const u = normalizeURL(a.getAttribute('href') || a.href);
+            if (!u || !/^https?:$/.test(u.protocol)) return false;
+            return !sameSite(u.hostname, location.hostname);
+        };
+
+        return { install, allowOpen, noteBlockedOpen, inGesture,
+                 isSyntheticCrossOriginBlank, state };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
        REALM PATCHER (NEW - fixes iframe bypass)
        ═══════════════════════════════════════════════════════════════ */
     const RealmPatcher = (() => {
@@ -365,14 +514,19 @@
                 patched.add(w);
                 w.__aab = 1;
 
-                // Block window.open in realm
+                // Block window.open in realm (gate gesture sama dengan window utama)
                 if (w.open && typeof w.open === 'function') {
                     const native = w.open;
                     w.open = function(...args) {
-                        const url = args[0];
-                        if (url && isBlockedURL(url)) {
+                        let allow = true;
+                        try {
+                            allow = GestureGuard.allowOpen(
+                                args[0], args[1],
+                                w.navigator?.userActivation?.isActive === true);
+                        } catch (e) { allow = true; }
+                        if (!allow) {
                             stats.popups++;
-                            log('Blocked realm popup:', url);
+                            log('Blocked realm popup:', args[0]);
                             return null;
                         }
                         return native.apply(this, args);
@@ -386,7 +540,8 @@
                     P.click = function() {
                         const tgt = this.getAttribute('target');
                         const href = this.getAttribute('href');
-                        if ((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) {
+                        if (((tgt === '_blank' || tgt === '_new') && isBlockedURL(href)) ||
+                            GestureGuard.isSyntheticCrossOriginBlank(this)) {
                             stats.syntheticClicks++;
                             log('Blocked realm anchor.click():', href);
                             return;
@@ -478,25 +633,19 @@
         // Create proxy ONCE and store in local variable
         const proxiedOpen = new Proxy(nativeOpen, {
             apply(target, thisArg, args) {
-                const requestedURL = args[0];
+                let allow = true;
+                try {
+                    allow = GestureGuard.allowOpen(
+                        args[0], args[1],
+                        navigator.userActivation?.isActive === true);
+                } catch (e) { allow = true; }
 
-                if (requestedURL && isBlockedURL(requestedURL)) {
+                if (!allow) {
                     stats.popups++;
-                    log('Blocked ad-domain popup:', requestedURL);
+                    log('Blocked popup:', args[0]);
                     return null;
                 }
-
-                const userActivation =
-                    navigator.userActivation?.isActive === true;
-
-                if (!userActivation) {
-                    stats.popups++;
-                    log('Blocked popup without consent:', requestedURL);
-                    return null;
-                }
-
-                // Allow legitimate user-initiated popups (zero-tolerance gate removed)
-
+                stats.opens++;
                 return Reflect.apply(target, thisArg, args);
             },
         });
@@ -529,7 +678,7 @@
             el instanceof HTMLAnchorElement &&
             (el.getAttribute('target') === '_blank' ||
              el.getAttribute('target') === '_new') &&
-            isBlockedURL(el.href);
+            (isBlockedURL(el.href) || GestureGuard.isSyntheticCrossOriginBlank(el));
 
         const install = () => {
             if (!CONFIG.BLOCK_SYNTHETIC_BLANK_CLICKS) return;
@@ -635,6 +784,44 @@
             log('CrossOriginBlocker installed');
         };
 
+        return { install };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
+       HISTORY FLOOD GUARD (NEW v9.2 — anti back-trap)
+       Script iklan suka men-spam history.pushState/replaceState agar
+       tombol back HP "muter" ke laman antah berantah. Router SPA yang
+       sehat hanya butuh beberapa panggilan per detik, jadi flood di
+       atas ambang aman dibuang.
+       ═══════════════════════════════════════════════════════════════ */
+    const HistoryGuard = (() => {
+        const install = () => {
+            if (!CONFIG.HISTORY_GUARD) return;
+            const stamps = [];
+            const wrap = name => {
+                const native = history[name];
+                if (typeof native !== 'function') return;
+                history[name] = function (...args) {
+                    try {
+                        const now = Date.now();
+                        while (stamps.length &&
+                               now - stamps[0] > CONFIG.HISTORY_WINDOW_MS) {
+                            stamps.shift();
+                        }
+                        if (stamps.length >= CONFIG.HISTORY_FLOOD_MAX) {
+                            stats.historyBlocks++;
+                            log(`Blocked history.${name} flood`);
+                            return undefined;
+                        }
+                        stamps.push(now);
+                    } catch (e) { warn('history guard failed:', e); }
+                    return native.apply(history, args);
+                };
+            };
+            wrap('pushState');
+            wrap('replaceState');
+            log('HistoryGuard installed');
+        };
         return { install };
     })();
 
@@ -867,6 +1054,103 @@
     })();
 
     /* ═══════════════════════════════════════════════════════════════
+       AD FOUNDRY — belajar dari ukuran slot iklan (NEW v9.2)
+       Keluhan: banner iklan yang lolos misalnya berukuran sama dengan
+       banner lain yang sudah terblokir, hanya beda source/domain/CDN.
+       Slot iklan yang berhasil dihapus mencatat ukurannya di sini.
+       Elemen lain yang berukuran persis sama akan dianggap iklan
+       kalau resource-nya lintas origin (atau tanpa resource sama
+       sekali, scaffold slot iklan kosong) — sehingga gambar konten
+       first-party tidak ikut terhapus.
+       ═══════════════════════════════════════════════════════════════ */
+    const AdFoundry = (() => {
+        const sizes = new Set(); // key: `${tag}:${w}x${h}`
+
+        const sizeOf = el => {
+            try {
+                if (!(el instanceof Element)) return null;
+                switch (el.tagName) {
+                    case 'IMG': {
+                        const r = el.getBoundingClientRect();
+                        const w = el.naturalWidth || Math.round(r.width);
+                        const h = el.naturalHeight || Math.round(r.height);
+                        return w > 0 && h > 0 ? `${w}x${h}` : null;
+                    }
+                    case 'SOURCE':
+                        return sizeOf(el.parentElement);
+                    case 'IFRAME': {
+                        const r = el.getBoundingClientRect();
+                        const w = Math.round(r.width);
+                        const h = Math.round(r.height);
+                        return w > 0 && h > 0 ? `${w}x${h}` : null;
+                    }
+                    case 'PICTURE': {
+                        const img = el.querySelector('img');
+                        return img ? sizeOf(img) : null;
+                    }
+                    default: {
+                        // Kontainer apapun (div/aside/ins/dll.): ikuti gambar di dalamnya.
+                        const img = el.querySelector?.('img');
+                        return img ? sizeOf(img) : null;
+                    }
+                }
+            } catch { return null; }
+        };
+
+        const resourceCrossOrigin = el => {
+            try {
+                const src = el.tagName === 'IFRAME'
+                    ? (el.getAttribute('src') || el.getAttribute('data-src'))
+                    : (el.currentSrc || el.getAttribute('src') ||
+                       el.getAttribute('data-src') || el.getAttribute('data-original'));
+                const u = normalizeURL(src);
+                if (!u) return true; // scaffold iklan tanpa resource, tetap layak curiga
+                return !sameSite(u.hostname, location.hostname);
+            } catch { return false; }
+        };
+
+        const remember = el => {
+            if (!CONFIG.BLOCK_ADS_BY_DIMENSION || sizes.size >= 64) return;
+            const tag = el?.tagName;
+            if (tag === 'IMG' || tag === 'PICTURE' || tag === 'SOURCE' || tag === 'IFRAME') {
+                const k = sizeOf(el);
+                if (k && COMMON_AD_DIMENSIONS.has(k)) sizes.add(`${tag}:${k}`);
+            }
+        };
+
+        const rememberInTree = root => {
+            if (!CONFIG.BLOCK_ADS_BY_DIMENSION) return;
+            try {
+                for (const el of (root?.querySelectorAll?.('img,picture,source,iframe') || [])) {
+                    remember(el);
+                    if (sizes.size >= 64) break;
+                }
+            } catch {}
+        };
+
+        const isAdSized = el => {
+            try {
+                const k = sizeOf(el);
+                return !!k && COMMON_AD_DIMENSIONS.has(k);
+            } catch { return false; }
+        };
+
+        const matchedBy = el => {
+            if (!CONFIG.BLOCK_ADS_BY_DIMENSION || !sizes.size) return false;
+            const tag = el?.tagName;
+            if (tag !== 'IMG' && tag !== 'PICTURE' && tag !== 'IFRAME' &&
+                tag !== 'SOURCE') return false;
+            const k = sizeOf(el);
+            if (!k || !sizes.has(`${tag}:${k}`)) return false;
+            // Butuh bukti tambahan agar gambar konten first-party tidak ikut terhapus:
+            return resourceCrossOrigin(el);
+        };
+
+        return { remember, rememberInTree, isAdSized, matchedBy,
+                 has: key => sizes.has(key) };
+    })();
+
+    /* ═══════════════════════════════════════════════════════════════
        DOM CLEANER
        ═══════════════════════════════════════════════════════════════ */
     const DOMCleaner = (() => {
@@ -940,14 +1224,35 @@
                 if (link) {
                     const href = link.getAttribute('href') || link.href;
                     if (href && isAdResourceURL(href)) return true;
+                    // NEW v9.2: banner lintas origin berukuran slot iklan = banner iklan
+                    if (CONFIG.BLOCK_ADS_BY_DIMENSION &&
+                        AdFoundry.isAdSized(el) &&
+                        /^(IMG|PICTURE|SOURCE)$/.test(el.tagName)) {
+                        const u = normalizeURL(href);
+                        if (u && !sameSite(u.hostname, location.hostname)) return true;
+                    }
+                }
+            } catch {}
+            // NEW v9.2: slot berukuran sama dengan slot iklan yang sudah dibuktikan
+            if (AdFoundry.matchedBy(el)) return true;
+            return false;
+        };
+        const isAdImageLink = el => {
+            if (!(el instanceof HTMLAnchorElement) ||
+                !el.querySelector?.('img,picture')) return false;
+            if (isAdResourceURL(el.getAttribute('href') || el.href)) return true;
+            // NEW v9.2: link lintas origin yang menggantung gambar ukuran iklan
+            if (!CONFIG.BLOCK_ADS_BY_DIMENSION) return false;
+            try {
+                const u = normalizeURL(el.getAttribute('href') || el.href);
+                if (!u || !/^https?:$/.test(u.protocol)) return false;
+                if (sameSite(u.hostname, location.hostname)) return false;
+                for (const img of el.querySelectorAll('img,picture')) {
+                    if (AdFoundry.isAdSized(img)) return true;
                 }
             } catch {}
             return false;
         };
-        const isAdImageLink = el =>
-            el instanceof HTMLAnchorElement &&
-            !!el.querySelector?.('img,picture') &&
-            isAdResourceURL(el.getAttribute('href') || el.href);
 
         const isAdGif = el => {
             if (!CONFIG.BLOCK_AD_GIFS) return false;
@@ -1005,6 +1310,8 @@
             if (isAdIframe(el)) return true;
             if (isAdGif(el)) return true;
             if (isAdImageLink(el)) return true;
+            // NEW v9.2: slot berukuran persis produk iklan yang pernah terbukti dihapus
+            if (CONFIG.BLOCK_ADS_BY_DIMENSION && AdFoundry.matchedBy(el)) return true;
             if (el.tagName === 'A' || el.tagName === 'AREA') {
                 const u = getResourceURL(el);
                 if (u && isBlockedURL(u)) return true;
@@ -1026,6 +1333,11 @@
                 !el.isConnected)
                 return false;
             removed.add(el);
+            // NEW v9.2: hafalkan ukuran slot iklan yang terbukti (sebelum dilepas)
+            try {
+                AdFoundry.remember(el);
+                AdFoundry.rememberInTree(el);
+            } catch (e) { warn('foundry record failed:', e); }
             log('Removed:', reason, el);
             el.remove();
             stats.elements++;
@@ -1036,6 +1348,7 @@
             if (isAdGif(el)) stats.gifs++;
             if (isAdIframe(el)) stats.iframes++;
             if (isBlankAdAnchor(el)) stats.blankAnchors++;
+            if (CONFIG.BLOCK_ADS_BY_DIMENSION && AdFoundry.matchedBy(el)) stats.dimension++;
         };
 
         const processElement = el => {
@@ -1361,12 +1674,14 @@
             if (!rect || rect.width < 200 || rect.height < 24) return false;
             if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
             // Require real ad proof so normal fixed headers/navbars are untouched.
-            return hasBannerName(el) || hasAdResource(el);
+            return hasBannerName(el) || hasAdResource(el) ||
+                   AdFoundry.matchedBy(el);
         };
         const remove = el => {
             if (isUserscriptUI(el) || removed.has(el) || !el.isConnected)
                 return false;
             removed.add(el);
+            try { AdFoundry.rememberInTree(el); } catch (e) { warn('foundry record failed:', e); }
             el.remove();
             stats.banners++;
             log('Removed fixed ad banner:', el);
@@ -1461,9 +1776,11 @@
     };
 
     try {
-        // ── Order matters! Install realm patcher FIRST ──
+        // ── Order matters! Install gesture recorder & realm patcher FIRST ──
+        GestureGuard.install();          // NEW v9.2: catat gesture/anchor + listener restore
         RealmPatcher.install();          // NEW: Patch iframe realms
         DocumentWriteGuard.install();    // NEW: Filter document.write ad injection
+        HistoryGuard.install();          // NEW v9.2: flood-control pushState/replaceState
         SocketBlocker.install();         // NEW: Block EventSource/WebSocket to ad URLs
         ScriptLoaderBlocker.install();   // NEW: Block ad scripts before they load
         CrossOriginBlocker.install();    // NEW: Block _blank links to ad domains
@@ -1481,13 +1798,14 @@
         Object.defineProperty(window, '__AAB', {
             value: Object.freeze({
                 getStats: () => ({ ...stats }),
+                getGesture: () => ({ ...GestureGuard.state }),
                 cleanup: runCleanup,
                 stopObserver: MutationEngine.stop,
             }),
             configurable: true,
         });
 
-        log('Initialized successfully (v9.1.1)');
+        log('Initialized successfully (v9.2.0)');
     } catch (err) {
         console.error(PREFIX, 'Initialization failed:', err);
     }
